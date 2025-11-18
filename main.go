@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,123 +10,204 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+	db "github/yeshu2004/go-epics/db"
 	"golang.org/x/net/html"
 )
 
-// first we have to get the seed url. ie a array of url'
-// then we have to GET req the links
-// following, hash the HTML file and check with bloomfilter.
-// if no, then download this HTML file into DB
-
-type UrlSeed struct {
-	Urls []string
-}
-
-func initalUrlSeed() []string {
+func initialUrlSeed() []string {
 	return []string{
-		// "https://en.wikipedia.org/wiki/Ramayana",
+		"https://en.wikipedia.org/wiki/Ramayana",
 		"https://en.wikipedia.org/wiki/Jai_Shri_Ram",
+		"https://en.wikipedia.org/wiki/Mahabharata",
+		"https://en.wikipedia.org/wiki/Hanuman",
 	}
 }
 
-func hashHTML(b []byte) (string, error) {
-	h := sha256.New()
-	_, err := h.Write(b)
+var (
+	queue  = make(chan string, 10000)
+	wg     sync.WaitGroup
+	client = &http.Client{Timeout: 30 * time.Second}
+)
+
+const (
+	workers    = 8
+	politeness = 800 * time.Millisecond
+	bfKey      = "wiki_bf_2025"
+)
+
+func worker(ctx context.Context, rdb *redis.Client) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case url, ok := <-queue:
+			if !ok {
+				log.Println("Worker exiting: queue closed")
+                return
+			}
+
+			time.Sleep(politeness)
+
+			body, err := fetchBody(url) // helper function used 
+			if err != nil {
+				log.Printf("Failed %s: %v", url, err)
+				continue
+			}
+
+			links := extractLinks(body, url) // helper function used
+
+			for _, link := range links {
+				if seenBefore(ctx, rdb, link) {
+					continue
+				}
+				markSeen(ctx, rdb, link)
+
+				select {
+				case <-ctx.Done():
+					return
+				case queue <- link: // pushes link in queue
+				default:
+				}
+			}
+			log.Printf("Extracted %d links from %s", len(links), url)
+
+		}
+	}
+	
+}
+
+// fetchBody returen the []byte i.e. res.Body and err if required, 
+// initally the req is send to link(string).
+func fetchBody(u string) ([]byte, error) {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "MyCollageProjectCrawler (https://github.com/yourname/my-crawler; yourname@example.com)")
+
+	res, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	hashSum := h.Sum(nil)                  // []bytes
-	hexHash := hex.EncodeToString(hashSum) // returns hash string
+	defer res.Body.Close()
 
-	return hexHash, nil
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", res.StatusCode)
+	}
+
+	log.Printf("Crawled: %s", u)
+	return io.ReadAll(res.Body)
 }
 
-func main() {
-	urls := initalUrlSeed() // outputs an array for crawl
-	log.Printf("total seeds for crawl (%v)\n", len(urls))
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+// parses the HTML doc and returns the slice of links extracted.
+func extractLinks(body []byte, baseURLStr string) []string {
+	base, _ := url.Parse(baseURLStr)
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil
 	}
 
-	for _, seed := range urls {
-		baseURL, _ := url.Parse(seed)
-		// every link will have its own queue(maybe chan what i am thinking of)
-
-		req, err := http.NewRequest("GET", seed, nil)
-		req.Header.Set("User-Agent", "MyCollageProjectCrawler (https://github.com/yourname/my-crawler; yourname@example.com)")
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		// GET Req
-		res, err := client.Do(req)
-		if err != nil {
-			log.Printf("Error fetching %s: %v\n", seed, err)
-			break
-		}
-		log.Printf("Crawling: %s\n", seed)
-
-		b, _ := io.ReadAll(res.Body)
-		defer res.Body.Close()
-
-		// TODO: HASH
-		str, err := hashHTML(b)
-		if err != nil || len(str) == 0 {
-			log.Fatalf("error in hashing HTML file: %v\n", err)
-		}
-		// TODO: BLOOMFILTER
-
-		// TODO: IF BF SAYS NO, STORE IN DB
-
-		// PARSING THE HTML FILE AND GETTING FURTHER LINKS AND JAI SHREE RAM
-		doc, err := html.Parse(bytes.NewReader(b))
-		if err != nil {
-			log.Printf("parse error %s: %v", seed, err)
-		}
-
-		var linksFound []string
-		var f func(*html.Node)
-		f = func(n *html.Node) {
-			if n.Type == html.ElementNode && n.Data == "a" {
-				for _, a := range n.Attr {
-					if a.Key == "href" {
-						fullURL := resolveURL(a.Val, baseURL)
-						if fullURL != "" && strings.Contains(fullURL, "wikipedia.org") {
-							linksFound = append(linksFound, fullURL)
+	var links []string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, a := range n.Attr {
+				if a.Key == "href" {
+					if full := resolveURL(a.Val, base); full != "" {
+						if full != "" && strings.Contains(full, "wikipedia.org") {
+							links = append(links, full)
 						}
-						break
 					}
 				}
 			}
-			// recurse on all children
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				f(c)
-			}
 		}
-		f(doc)
-		log.Printf("found %d links on %s\n", len(linksFound), seed)
-
-
-		for _,link := range linksFound{
-			fmt.Println(link)
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
 		}
+	}
+	walk(doc)
+	return links
+}
+
+// Check's if Bloom Filter has the url.
+func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
+	hash := hashURL(url)
+	exists, err := rdb.BFExists(ctx, bfKey, hash).Result()
+	if err != nil {
+		log.Printf("BFExists error: %v", err)
+		return true
+	}
+	return exists
+}
+
+// marks the url in Bloom Filter.
+func markSeen(ctx context.Context, rdb *redis.Client, url string) {
+	hash := hashURL(url)
+	if err := rdb.BFAdd(ctx, bfKey, hash).Err(); err != nil {
+		log.Printf("BFAdd failed for %s: %v", url, err)
 	}
 }
 
+func hashURL(u string) string {
+	h := sha256.Sum256([]byte(u))
+	return hex.EncodeToString(h[:])
+}
 func resolveURL(href string, base *url.URL) string {
 	u, err := url.Parse(href)
-	if err != nil {
+	if err != nil || (u.Host != "" && u.Host != base.Host) {
 		return ""
 	}
 	resolved := base.ResolveReference(u)
-	if resolved.Scheme != "https" && resolved.Scheme != "http" {
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
 		return ""
 	}
-	// Remove fragments
 	resolved.Fragment = ""
+	resolved.RawQuery = ""
 	return resolved.String()
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb, err := db.RedisInit(ctx)
+	if err != nil {
+		log.Fatal("Redis connection failed:", err)
+	}
+	defer rdb.Close()
+
+	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, 0.001, 100000); err != nil {
+		log.Fatal("Bloom filter init failed:", err)
+	}
+
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		log.Println("\nShutting down gracefully...")
+		cancel()
+		close(queue)
+	}()
+
+	for _, seed := range initialUrlSeed() {
+		if !seenBefore(ctx, rdb, seed) {
+			markSeen(ctx, rdb, seed)
+			queue <- seed
+		}
+	}
+
+	// start workers
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker(ctx, rdb)
+	}
+
+	wg.Wait()
+	log.Println("Crawl completed successfully!")
 }

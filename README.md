@@ -1,4 +1,4 @@
-## Web Cralwer
+## Web Crawler
 
 A simple and efficient web crawler written in Go. This is designed for crawling web pages and following links to deepen exploration(BFS approch).
 

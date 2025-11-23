@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	_"github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/redis/go-redis/v9"
 	db "github/yeshu2004/go-epics/db"
 	"golang.org/x/net/html"
@@ -36,7 +36,7 @@ var (
 	queue     = make(chan string, 10000)
 	wg        sync.WaitGroup
 	client    = &http.Client{Timeout: 30 * time.Second}
-	pgDB      *sql.DB
+	sqliteDB  *sql.DB
 	dbMutex   sync.Mutex
 )
 
@@ -44,11 +44,11 @@ const (
 	workers    = 8
 	politeness = 800 * time.Millisecond
 	bfKey      = "wiki_bf_2025"
+	dbPath     = "./crawler.db"
 )
 
-func initPostgres() (*sql.DB, error) {
-	connStr := "user=postgres password=yourpassword dbname=crawler_db sslmode=disable"
-	database, err := sql.Open("postgres", connStr)
+func initSQLite() (*sql.DB, error) {
+	database, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -59,14 +59,14 @@ func initPostgres() (*sql.DB, error) {
 
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS crawled_pages (
-		id SERIAL PRIMARY KEY,
-		url VARCHAR(2048) UNIQUE NOT NULL,
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		url TEXT UNIQUE NOT NULL,
 		html_content TEXT NOT NULL,
-		html_hash VARCHAR(64) NOT NULL,
-		status_code INT,
+		html_hash TEXT NOT NULL,
+		status_code INTEGER,
 		crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		title VARCHAR(255),
-		links_count INT
+		title TEXT,
+		links_count INTEGER
 	);
 	
 	CREATE INDEX IF NOT EXISTS idx_url ON crawled_pages(url);
@@ -77,7 +77,7 @@ func initPostgres() (*sql.DB, error) {
 		return nil, err
 	}
 
-	log.Println("PostgreSQL connected and tables initialized")
+	log.Println("SQLite connected and tables initialized")
 	return database, nil
 }
 
@@ -89,15 +89,11 @@ func storeHTMLToDB(ctx context.Context, urlStr string, htmlContent []byte, statu
 	defer dbMutex.Unlock()
 
 	insertSQL := `
-	INSERT INTO crawled_pages (url, html_content, html_hash, status_code, title, links_count)
-	VALUES ($1, $2, $3, $4, $5, $6)
-	ON CONFLICT (url) DO UPDATE SET 
-		html_content = EXCLUDED.html_content,
-		status_code = EXCLUDED.status_code,
-		crawled_at = CURRENT_TIMESTAMP
+	INSERT OR REPLACE INTO crawled_pages (url, html_content, html_hash, status_code, title, links_count, crawled_at)
+	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	`
 
-	if _, err := pgDB.ExecContext(ctx, insertSQL, urlStr, string(htmlContent), hash, statusCode, title, linksCount); err != nil {
+	if _, err := sqliteDB.ExecContext(ctx, insertSQL, urlStr, string(htmlContent), hash, statusCode, title, linksCount); err != nil {
 		log.Printf("Failed to store HTML for %s: %v", urlStr, err)
 		return err
 	}
@@ -150,7 +146,6 @@ func worker(ctx context.Context, rdb *redis.Client) {
 				continue
 			}
 
-			// Store HTML in database
 			links := extractLinks(body, urlStr)
 			if err := storeHTMLToDB(ctx, urlStr, body, statusCode, len(links)); err != nil {
 				log.Printf("Failed to store HTML: %v", err)
@@ -260,11 +255,11 @@ func resolveURL(href string, base *url.URL) string {
 
 func main() {
 	var err error
-	pgDB, err = initPostgres()
+	sqliteDB, err = initSQLite()
 	if err != nil {
-		log.Fatal("PostgreSQL connection failed:", err)
+		log.Fatal("SQLite connection failed:", err)
 	}
-	defer pgDB.Close()
+	defer sqliteDB.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -3,6 +3,8 @@ module github/yeshu2004/go-epics
 go 1.24.1
 
 require (
+	github.com/lib/pq v1.10.9
+	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/redis/go-redis/v9 v9.16.0
 	golang.org/x/net v0.47.0
 )

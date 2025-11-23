@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/redis/go-redis/v9"
 	db "github/yeshu2004/go-epics/db"
 	"golang.org/x/net/html"
@@ -31,16 +33,97 @@ func initialUrlSeed() []string {
 }
 
 var (
-	queue  = make(chan string, 10000)
-	wg     sync.WaitGroup
-	client = &http.Client{Timeout: 30 * time.Second}
+	queue     = make(chan string, 10000)
+	wg        sync.WaitGroup
+	client    = &http.Client{Timeout: 30 * time.Second}
+	sqliteDB  *sql.DB
+	dbMutex   sync.Mutex
 )
 
 const (
 	workers    = 8
 	politeness = 800 * time.Millisecond
 	bfKey      = "wiki_bf_2025"
+	dbPath     = "./crawler.db"
 )
+
+func initSQLite() (*sql.DB, error) {
+	database, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := database.Ping(); err != nil {
+		return nil, err
+	}
+
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS crawled_pages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		url TEXT UNIQUE NOT NULL,
+		html_content TEXT NOT NULL,
+		html_hash TEXT NOT NULL,
+		status_code INTEGER,
+		crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		title TEXT,
+		links_count INTEGER
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_url ON crawled_pages(url);
+	CREATE INDEX IF NOT EXISTS idx_hash ON crawled_pages(html_hash);
+	`
+
+	if _, err := database.Exec(createTableSQL); err != nil {
+		return nil, err
+	}
+
+	log.Println("SQLite connected and tables initialized")
+	return database, nil
+}
+
+func storeHTMLToDB(ctx context.Context, urlStr string, htmlContent []byte, statusCode int, linksCount int) error {
+	hash := hashURL(urlStr)
+	title := extractTitle(htmlContent)
+
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	insertSQL := `
+	INSERT OR REPLACE INTO crawled_pages (url, html_content, html_hash, status_code, title, links_count, crawled_at)
+	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`
+
+	if _, err := sqliteDB.ExecContext(ctx, insertSQL, urlStr, string(htmlContent), hash, statusCode, title, linksCount); err != nil {
+		log.Printf("Failed to store HTML for %s: %v", urlStr, err)
+		return err
+	}
+
+	log.Printf("Stored HTML for: %s", urlStr)
+	return nil
+}
+
+func extractTitle(htmlContent []byte) string {
+	doc, err := html.Parse(bytes.NewReader(htmlContent))
+	if err != nil {
+		return ""
+	}
+
+	var title string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "title" {
+			if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+				title = n.FirstChild.Data
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return title
+}
 
 func worker(ctx context.Context, rdb *redis.Client) {
 	defer wg.Done()
@@ -49,21 +132,24 @@ func worker(ctx context.Context, rdb *redis.Client) {
 		select {
 		case <-ctx.Done():
 			return
-		case url, ok := <-queue:
+		case urlStr, ok := <-queue:
 			if !ok {
 				log.Println("Worker exiting: queue closed")
-                return
+				return
 			}
 
 			time.Sleep(politeness)
 
-			body, err := fetchBody(url) // helper function used 
+			body, statusCode, err := fetchBody(urlStr)
 			if err != nil {
-				log.Printf("Failed %s: %v", url, err)
+				log.Printf("Failed %s: %v", urlStr, err)
 				continue
 			}
 
-			links := extractLinks(body, url) // helper function used
+			links := extractLinks(body, urlStr)
+			if err := storeHTMLToDB(ctx, urlStr, body, statusCode, len(links)); err != nil {
+				log.Printf("Failed to store HTML: %v", err)
+			}
 
 			for _, link := range links {
 				if seenBefore(ctx, rdb, link) {
@@ -74,38 +160,34 @@ func worker(ctx context.Context, rdb *redis.Client) {
 				select {
 				case <-ctx.Done():
 					return
-				case queue <- link: // pushes link in queue
+				case queue <- link:
 				default:
 				}
 			}
-			log.Printf("Extracted %d links from %s", len(links), url)
-
+			log.Printf("Extracted %d links from %s", len(links), urlStr)
 		}
 	}
-	
 }
 
-// fetchBody returen the []byte i.e. res.Body and err if required, 
-// initally the req is send to link(string).
-func fetchBody(u string) ([]byte, error) {
+func fetchBody(u string) ([]byte, int, error) {
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set("User-Agent", "MyCollageProjectCrawler (https://github.com/yourname/my-crawler; yourname@example.com)")
 
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", res.StatusCode)
+		return nil, res.StatusCode, fmt.Errorf("status %d", res.StatusCode)
 	}
 
 	log.Printf("Crawled: %s", u)
-	return io.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
+	return body, res.StatusCode, err
 }
 
-// parses the HTML doc and returns the slice of links extracted.
 func extractLinks(body []byte, baseURLStr string) []string {
 	base, _ := url.Parse(baseURLStr)
 	doc, err := html.Parse(bytes.NewReader(body))
@@ -120,7 +202,7 @@ func extractLinks(body []byte, baseURLStr string) []string {
 			for _, a := range n.Attr {
 				if a.Key == "href" {
 					if full := resolveURL(a.Val, base); full != "" {
-						if full != "" && strings.Contains(full, "wikipedia.org") {
+						if strings.Contains(full, "wikipedia.org") {
 							links = append(links, full)
 						}
 					}
@@ -135,7 +217,6 @@ func extractLinks(body []byte, baseURLStr string) []string {
 	return links
 }
 
-// Check's if Bloom Filter has the url.
 func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
 	hash := hashURL(url)
 	exists, err := rdb.BFExists(ctx, bfKey, hash).Result()
@@ -146,7 +227,6 @@ func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
 	return exists
 }
 
-// marks the url in Bloom Filter.
 func markSeen(ctx context.Context, rdb *redis.Client, url string) {
 	hash := hashURL(url)
 	if err := rdb.BFAdd(ctx, bfKey, hash).Err(); err != nil {
@@ -158,6 +238,7 @@ func hashURL(u string) string {
 	h := sha256.Sum256([]byte(u))
 	return hex.EncodeToString(h[:])
 }
+
 func resolveURL(href string, base *url.URL) string {
 	u, err := url.Parse(href)
 	if err != nil || (u.Host != "" && u.Host != base.Host) {
@@ -173,6 +254,13 @@ func resolveURL(href string, base *url.URL) string {
 }
 
 func main() {
+	var err error
+	sqliteDB, err = initSQLite()
+	if err != nil {
+		log.Fatal("SQLite connection failed:", err)
+	}
+	defer sqliteDB.Close()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -202,7 +290,6 @@ func main() {
 		}
 	}
 
-	// start workers
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go worker(ctx, rdb)

@@ -14,10 +14,12 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	db "github/yeshu2004/go-epics/db"
+
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
 )
 
@@ -31,9 +33,10 @@ func initialUrlSeed() []string {
 }
 
 var (
-	queue  = make(chan string, 10000)
-	wg     sync.WaitGroup
-	client = &http.Client{Timeout: 30 * time.Second}
+	duplicateCount atomic.Int64
+	queue          = make(chan string, 10000)
+	wg             sync.WaitGroup
+	client         = &http.Client{Timeout: 30 * time.Second}
 )
 
 const (
@@ -52,12 +55,12 @@ func worker(ctx context.Context, rdb *redis.Client) {
 		case url, ok := <-queue:
 			if !ok {
 				log.Println("Worker exiting: queue closed")
-                return
+				return
 			}
 
 			time.Sleep(politeness)
 
-			body, err := fetchBody(url) // helper function used 
+			body, err := fetchBody(url) // helper function used
 			if err != nil {
 				log.Printf("Failed %s: %v", url, err)
 				continue
@@ -67,6 +70,10 @@ func worker(ctx context.Context, rdb *redis.Client) {
 
 			for _, link := range links {
 				if seenBefore(ctx, rdb, link) {
+					total := duplicateCount.Add(1)
+					if total <= 100 || total%5000 == 0 {
+						log.Printf("Duplicate skipped (%d total): %s", total, link)
+					}
 					continue
 				}
 				markSeen(ctx, rdb, link)
@@ -82,10 +89,10 @@ func worker(ctx context.Context, rdb *redis.Client) {
 
 		}
 	}
-	
+
 }
 
-// fetchBody returen the []byte i.e. res.Body and err if required, 
+// fetchBody returen the []byte i.e. res.Body and err if required,
 // initally the req is send to link(string).
 func fetchBody(u string) ([]byte, error) {
 	req, _ := http.NewRequest("GET", u, nil)
@@ -140,6 +147,9 @@ func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
 	hash := hashURL(url)
 	exists, err := rdb.BFExists(ctx, bfKey, hash).Result()
 	if err != nil {
+		if ctx.Err() == context.Canceled {
+			return true
+		}
 		log.Printf("BFExists error: %v", err)
 		return true
 	}
@@ -169,6 +179,10 @@ func resolveURL(href string, base *url.URL) string {
 	}
 	resolved.Fragment = ""
 	resolved.RawQuery = ""
+	resolved.Path = strings.ToLower(resolved.Path)
+	if resolved.Path != "" && !strings.HasSuffix(resolved.Path, "/") {
+		resolved.Path = strings.TrimSuffix(resolved.Path, "/")
+	}
 	return resolved.String()
 }
 

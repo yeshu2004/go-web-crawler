@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -13,6 +14,7 @@ func InitializeBloomFilter(ctx context.Context, client *redis.Client, bloomKey s
 	if err != nil {
 		log.Fatalf("failed to check if key exists: %v", err)
 	}
+
 	if res == 0 {
 		if err := client.BFReserve(ctx, bloomKey, errorRate, capacity).Err(); err != nil {
 			log.Fatalf("failed to create Bloom filter: %v", err)
@@ -20,7 +22,16 @@ func InitializeBloomFilter(ctx context.Context, client *redis.Client, bloomKey s
 		fmt.Printf("succesfully initalized bloom filter: %v\n", bloomKey)
 	}
 	if res == 1 {
-		fmt.Printf("bloom filter already initalized with the key: %v", bloomKey)
+		log.Println("clearing old Bloom filter...")
+		if err := client.Del(ctx, bloomKey).Err(); err != nil {
+			log.Fatal("failed to delete old BF:", err)
+		}
+		time.Sleep(time.Millisecond *1)
+		if err := client.BFReserve(ctx, bloomKey, errorRate, capacity).Err(); err != nil {
+			log.Fatalf("failed to create Bloom filter: %v", err)
+		}
+		fmt.Printf("succesfully initalized bloom filter: %v\n", bloomKey)
+
 	}
 	return nil
 }

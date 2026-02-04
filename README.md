@@ -12,7 +12,7 @@ A simple and efficient web crawler written in Go. This is designed for crawling 
 - Added comments for easy work flow
 
 
-# Run 
+## Run 
 1. **Set Up Redis Stack with Docker**:
    - Pull the Redis Stack image:
      ```bash
@@ -27,7 +27,7 @@ A simple and efficient web crawler written in Go. This is designed for crawling 
      docker ps
      ```
 
-# Output
+## Output
 
 <img width="1280" height="797" alt="Screenshot 2026-02-04 at 10 37 23 AM" src="https://github.com/user-attachments/assets/1cc98cfe-54dd-4031-b37a-cfacfcf688a5" />
 

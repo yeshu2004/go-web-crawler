@@ -17,19 +17,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github/yeshu2004/go-epics/compress"
 	db "github/yeshu2004/go-epics/db"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
 )
 
 func initialUrlSeed() []string {
 	return []string{
-		"https://en.wikipedia.org/wiki/Ramayana",
-		"https://en.wikipedia.org/wiki/Jai_Shri_Ram",
-		"https://en.wikipedia.org/wiki/Mahabharata",
-		"https://en.wikipedia.org/wiki/Hanuman",
+		"https://www.thehindu.com/",
 	}
+}
+
+type Client struct{
+	badgerDb *badger.DB
+	redisDB *redis.Client
 }
 
 var (
@@ -37,6 +41,8 @@ var (
 	queue          = make(chan string, 10000)
 	wg             sync.WaitGroup
 	client         = &http.Client{Timeout: 30 * time.Second}
+	expected       = 10000000
+	fp_rate        = 0.001
 )
 
 const (
@@ -45,7 +51,7 @@ const (
 	bfKey      = "wiki_bf_2025"
 )
 
-func worker(ctx context.Context, rdb *redis.Client) {
+func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 	defer wg.Done()
 
 	for {
@@ -66,17 +72,37 @@ func worker(ctx context.Context, rdb *redis.Client) {
 				continue
 			}
 
+			// TODO: store in db
+			key := hashURL(url);
+			compressedBody, err := compress.GzipCompress(body);
+			if err != nil{
+				log.Fatalf("compression error: %v", err);
+			}
+
+			if err := c.badgerDb.Update(func(txn *badger.Txn) error {
+				return txn.Set([]byte(key), compressedBody);
+			}); err != nil {
+				log.Printf("Failed to store in BadgerDB: %v", err)
+			}
+
 			links := extractLinks(body, url) // helper function used
 
 			for _, link := range links {
-				if seenBefore(ctx, rdb, link) {
+				// bloom filter check, if present skip-> for matrix
+				hashed := hashURL(link)
+				added, err := rdb.BFAdd(ctx, bfKey, hashed).Result()
+				if err != nil {
+					log.Printf("BFAdd error: %v", err)
+					continue
+				}
+
+				if !added {
 					total := duplicateCount.Add(1)
 					if total <= 100 || total%5000 == 0 {
 						log.Printf("Duplicate skipped (%d total): %s", total, link)
 					}
 					continue
 				}
-				markSeen(ctx, rdb, link)
 
 				select {
 				case <-ctx.Done():
@@ -127,7 +153,7 @@ func extractLinks(body []byte, baseURLStr string) []string {
 			for _, a := range n.Attr {
 				if a.Key == "href" {
 					if full := resolveURL(a.Val, base); full != "" {
-						if full != "" && strings.Contains(full, "wikipedia.org") {
+						if full != "" {
 							links = append(links, full)
 						}
 					}
@@ -142,7 +168,7 @@ func extractLinks(body []byte, baseURLStr string) []string {
 	return links
 }
 
-// Check's if Bloom Filter has the url.
+// Check's if Bloom Filter has the url(Redis).
 func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
 	hash := hashURL(url)
 	exists, err := rdb.BFExists(ctx, bfKey, hash).Result()
@@ -156,7 +182,7 @@ func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
 	return exists
 }
 
-// marks the url in Bloom Filter.
+// marks the url in Bloom Filter(Redis).
 func markSeen(ctx context.Context, rdb *redis.Client, url string) {
 	hash := hashURL(url)
 	if err := rdb.BFAdd(ctx, bfKey, hash).Err(); err != nil {
@@ -190,16 +216,30 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// redis connection
 	rdb, err := db.RedisInit(ctx)
 	if err != nil {
 		log.Fatal("Redis connection failed:", err)
 	}
 	defer rdb.Close()
 
-	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, 0.001, 100000); err != nil {
+	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
 		log.Fatal("Bloom filter init failed:", err)
 	}
 
+	// badgerDB connection
+	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"));
+	if err != nil {
+		log.Fatal("BadgerDB connection failed:", err)
+	}
+	defer baddgerDB.Close()
+
+	cli := &Client{
+		badgerDb: baddgerDB,
+		redisDB: rdb,
+	}
+
+	// handle graceful shutdown
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
@@ -219,7 +259,7 @@ func main() {
 	// start workers
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go worker(ctx, rdb)
+		go cli.worker(ctx, rdb) // <- entry point for worker
 	}
 
 	wg.Wait()

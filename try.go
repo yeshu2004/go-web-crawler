@@ -1,6 +1,6 @@
 //// IMP: this approch is DFS(NOT WORKING)
 
-// package main
+package main
 
 // import (
 // 	"bytes"

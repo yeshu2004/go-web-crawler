@@ -27,7 +27,7 @@ import (
 
 func initialUrlSeed() []string {
 	return []string{
-		"https://www.thehindu.com/",
+		"https://timesofindia.indiatimes.com/",
 	}
 }
 
@@ -225,7 +225,7 @@ func main() {
 
 	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
 		log.Fatal("Bloom filter init failed:", err)
-	}
+	}	
 
 	// badgerDB connection
 	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"));

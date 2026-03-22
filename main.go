@@ -86,6 +86,10 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 
 			text := extractText(body); // extracts the text from the html page
 			freqMap := buildFreqMap(text); // builds a word coud freq map 
+
+			// uncomment this, for logging purpose.
+			fmt.Println(freqMap)
+			time.Sleep(5*time.Second)
 			
 			// type Posting struct {
 			// 	URLHash string

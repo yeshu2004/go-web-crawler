@@ -12,10 +12,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github/yeshu2004/go-epics/compress"
 	db "github/yeshu2004/go-epics/db"
@@ -27,7 +29,8 @@ import (
 
 func initialUrlSeed() []string {
 	return []string{
-		"https://timesofindia.indiatimes.com/",
+		"https://en.wikipedia.org/wiki/Hindus",
+		"https://www.indiatoday.in/",
 	}
 }
 
@@ -60,7 +63,7 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 			return
 		case url, ok := <-queue:
 			if !ok {
-				log.Println("Worker exiting: queue closed")
+				log.Println("worker exiting: queue closed")
 				return
 			}
 
@@ -68,12 +71,29 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 
 			body, err := fetchBody(url) // helper function used
 			if err != nil {
-				log.Printf("Failed %s: %v", url, err)
+				log.Printf("failed %s: %v", url, err)
 				continue
 			}
 
-			// TODO: store in db
 			key := hashURL(url);
+			// TODO V2: store in db
+			// we have raw body and we have to make in memory hash for itteration
+			// also we can only put the hash key if it's length is more then 2(bcz most
+			// valuable words are greater than 2 in length or say has length 3 or more)
+			// in memory hash -> key: word, value: count
+
+			// then write in memTbale -> key: word, value: [].append("hashurl"-> count);
+
+			text := extractText(body); // extracts the text from the html page
+			freqMap := buildFreqMap(text); // builds a word coud freq map 
+			
+			// type Posting struct {
+			// 	URLHash string
+			// 	Freq    int
+			// }
+	
+			// var postings map[string][]Posting
+	
 			compressedBody, err := compress.GzipCompress(body);
 			if err != nil{
 				log.Fatalf("compression error: %v", err);
@@ -82,7 +102,7 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 			if err := c.badgerDb.Update(func(txn *badger.Txn) error {
 				return txn.Set([]byte(key), compressedBody);
 			}); err != nil {
-				log.Printf("Failed to store in BadgerDB: %v", err)
+				log.Printf("failed to store in BadgerDB: %v", err)
 			}
 
 			links := extractLinks(body, url) // helper function used
@@ -115,7 +135,60 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 
 		}
 	}
+}
 
+
+
+func buildFreqMap(text string) map[string]int {
+	freqMap := make(map[string]int);
+	text = strings.ToLower(text);
+
+	reg := regexp.MustCompile(`[^\p{L}\p{N}]+`)
+	words := reg.Split(text, -1)
+
+	for _, word := range words{
+		if len(word) < 3{
+			continue;
+		}
+
+		hasVaildLetter := false;
+		for _, r := range word{
+			if unicode.IsLetter(r){
+				hasVaildLetter = true;
+			}
+		}
+
+		if hasVaildLetter{
+			freqMap[word]++;
+		}
+	}
+
+	return freqMap;
+}
+
+func extractText(body []byte) string{
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil{
+		log.Printf(err.Error());
+		return ""
+	}
+
+	var textBuilder strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			textBuilder.WriteString(n.Data)
+			textBuilder.WriteString(" ")
+		}
+		if n.Type == html.ElementNode && (n.Data == "script" || n.Data == "style") {
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return textBuilder.String()
 }
 
 // fetchBody returen the []byte i.e. res.Body and err if required,

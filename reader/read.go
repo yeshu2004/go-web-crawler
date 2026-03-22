@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -43,11 +44,14 @@ func main() {
 			}
 
 			filename := fmt.Sprintf("page_%d.html", i)
-			if err := os.WriteFile(filename, htmlBytes, 0644); err != nil {
+			if err := os.WriteFile(filename, htmlBytes, 0600); err != nil {
 				return err
 			}
 
-			fmt.Println("Saved:", filename)
+			// Sanitize filename for logging to prevent log injection
+			safeFilename := strings.ReplaceAll(filename, "\n", "")
+			safeFilename = strings.ReplaceAll(safeFilename, "\r", "")
+			fmt.Printf("Saved: %s\n", safeFilename)
 
 			i++
 			// if i == 3 { // export first 3 pages

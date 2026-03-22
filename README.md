@@ -1,31 +1,73 @@
 ## Web Crawler
 
-A simple and efficient web crawler written in Go. This is designed for crawling web pages and following links to deepen exploration(BFS approch).
+A secure and efficient web crawler written in Go with dual engine support: local crawling and Cloudflare Browser Rendering API integration.
 
 ## Features
 
-- Multi-threaded crawling for efficiency
-- Bloom Filter for Duplicates URL
-- Customizable depth and URL filtering
-- Graceful handling of robots.txt
-- Parsing HTML and extraction of links
-- Added comments for easy work flow
+- **Dual Crawler Engines**: Local multi-threaded crawling or Cloudflare API-based crawling
+- **Security Hardened**: SSRF protection, input validation, secure file permissions
+- **Bloom Filter Deduplication**: Redis-based duplicate URL prevention
+- **Configurable**: Environment-based configuration with secure defaults
+- **Graceful Shutdown**: Clean resource management and signal handling
+- **Rate Limiting**: Respects politeness delays and API limits
+
+## Security Fixes Applied
+
+- ✅ **Fixed Hardcoded Credentials** (CWE-259, CWE-798)
+- ✅ **Fixed SSRF Vulnerability** (CWE-918) with domain allowlisting
+- ✅ **Fixed Log Injection** (CWE-117) with input sanitization
+- ✅ **Fixed Insecure File Permissions** (CWE-276)
+- ✅ **Optimized Redundant Conditionals**
 
 
-## Run 
-1. **Set Up Redis Stack with Docker**:
-   - Pull the Redis Stack image:
-     ```bash
-     docker pull redis/redis-stack:latest
-     ```
-   - Run the Redis Stack container:
-     ```bash
-     docker run -d -p 6379:6379 --name redis-stack redis/redis-stack:latest
-     ```
-   - Verify the container is running:
-     ```bash
-     docker ps
-     ```
+## Setup & Run
+
+### 1. Redis Setup
+```bash
+# Pull and run Redis Stack
+docker pull redis/redis-stack:latest
+docker run -d -p 6379:6379 --name redis-stack redis/redis-stack:latest
+
+# Verify Redis is running
+docker ps
+```
+
+### 2. Environment Configuration
+```bash
+# Copy example environment file
+cp .env.example .env
+
+# Edit .env with your configuration
+# For local crawling (default):
+CRAWLER_ENGINE=local
+REDIS_URL=redis://localhost:6379
+ALLOWED_DOMAINS=wikipedia.org,indiatoday.in
+
+# For Cloudflare crawling:
+CRAWLER_ENGINE=cloudflare
+CLOUDFLARE_API_TOKEN=your_token_here
+CLOUDFLARE_ACCOUNT_ID=your_account_id_here
+```
+
+### 3. Run the Crawler
+```bash
+# Local crawler
+./test_crawler.sh
+
+# Or directly with Go
+go run main.go
+```
+
+## Cloudflare Integration
+
+The crawler now supports Cloudflare's Browser Rendering API for enhanced crawling capabilities:
+
+- **Scalable**: Leverages Cloudflare's infrastructure
+- **JavaScript Support**: Renders dynamic content
+- **Rate Limit Friendly**: Built-in request management
+- **Markdown Output**: Clean, structured content extraction
+
+See [CLOUDFLARE_INTEGRATION.md](CLOUDFLARE_INTEGRATION.md) for detailed setup instructions.
 
 ## Output
 

@@ -1,0 +1,271 @@
+package db
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"os"
+
+	"github.com/dgraph-io/badger/v3"
+)
+
+// PageMetadata stores metadata about a crawled page.
+type PageMetadata struct {
+	URL         string `json:"url"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	StatusCode  int    `json:"statusCode"`
+	ContentType string `json:"contentType"`
+	CrawledAt   string `json:"crawledAt"`
+	SourceSize  int    `json:"sourceSize"` // Size before compression
+	CompressedSize int `json:"compressedSize"` // Size after compression
+}
+
+// BadgerStore handles all database operations.
+type BadgerStore struct {
+	db *badger.DB
+}
+
+// NewBadgerStore creates a new BadgerDB store instance.
+func NewBadgerStore(dbPath string) (*BadgerStore, error) {
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(dbPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create badger db directory: %w", err)
+	}
+
+	opts := badger.DefaultOptions(dbPath).
+		WithLoggingLevel(badger.ERROR). // Reduce verbosity
+		WithValueLogFileSize(1 << 25).  // 32MB value log files
+		WithNumGoroutines(8)
+
+	db, err := badger.Open(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open badger db: %w", err)
+	}
+
+	log.Printf("BadgerDB initialized at %s", dbPath)
+	return &BadgerStore{db: db}, nil
+}
+
+// StorePage stores a crawled page with metadata and compression.
+func (bs *BadgerStore) StorePage(urlHash string, content string, metadata PageMetadata) error {
+	txn := bs.db.NewTransaction(true)
+	defer txn.Discard()
+
+	// Compress content
+	compressed, originalSize, compressedSize, err := compressContent(content)
+	if err != nil {
+		return fmt.Errorf("failed to compress content: %w", err)
+	}
+
+	// Update metadata with compression info
+	metadata.SourceSize = originalSize
+	metadata.CompressedSize = compressedSize
+
+	// Store compressed content with key: "page:{urlHash}"
+	pageKey := fmt.Sprintf("page:%s", urlHash)
+	if err := txn.Set([]byte(pageKey), compressed); err != nil {
+		return fmt.Errorf("failed to store page content: %w", err)
+	}
+
+	// Store metadata with key: "meta:{urlHash}"
+	metaKey := fmt.Sprintf("meta:%s", urlHash)
+	metaBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	if err := txn.Set([]byte(metaKey), metaBytes); err != nil {
+		return fmt.Errorf("failed to store metadata: %w", err)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	compressionRatio := float64(compressedSize) / float64(originalSize) * 100
+	log.Printf("Stored page %s (%.1f%% compression ratio, compressed: %d → %d bytes)",
+		metadata.URL, compressionRatio, originalSize, compressedSize)
+	return nil
+}
+
+// RetrievePage retrieves a stored page and decompresses it.
+func (bs *BadgerStore) RetrievePage(urlHash string) (string, *PageMetadata, error) {
+	var content string
+	var metadata PageMetadata
+
+	err := bs.db.View(func(txn *badger.Txn) error {
+		// Retrieve compressed content
+		pageKey := fmt.Sprintf("page:%s", urlHash)
+		item, err := txn.Get([]byte(pageKey))
+		if err != nil {
+			return fmt.Errorf("failed to retrieve page content: %w", err)
+		}
+
+		compressed, err := item.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("failed to copy page value: %w", err)
+		}
+
+		// Decompress content
+		decompressed, err := decompressContent(compressed)
+		if err != nil {
+			return fmt.Errorf("failed to decompress content: %w", err)
+		}
+		content = decompressed
+
+		// Retrieve metadata
+		metaKey := fmt.Sprintf("meta:%s", urlHash)
+		metaItem, err := txn.Get([]byte(metaKey))
+		if err != nil {
+			return fmt.Errorf("failed to retrieve metadata: %w", err)
+		}
+
+		metaBytes, err := metaItem.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("failed to copy metadata value: %w", err)
+		}
+
+		if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+			return fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+
+		return nil
+	})
+
+	return content, &metadata, err
+}
+
+// PageExists checks if a page exists in the database.
+func (bs *BadgerStore) PageExists(urlHash string) bool {
+	err := bs.db.View(func(txn *badger.Txn) error {
+		pageKey := fmt.Sprintf("page:%s", urlHash)
+		_, err := txn.Get([]byte(pageKey))
+		return err
+	})
+	return err == nil
+}
+
+// DeletePage removes a stored page and its metadata.
+func (bs *BadgerStore) DeletePage(urlHash string) error {
+	txn := bs.db.NewTransaction(true)
+	defer txn.Discard()
+
+	// Delete page content
+	pageKey := fmt.Sprintf("page:%s", urlHash)
+	if err := txn.Delete([]byte(pageKey)); err != nil && err != badger.ErrKeyNotFound {
+		return fmt.Errorf("failed to delete page content: %w", err)
+	}
+
+	// Delete metadata
+	metaKey := fmt.Sprintf("meta:%s", urlHash)
+	if err := txn.Delete([]byte(metaKey)); err != nil && err != badger.ErrKeyNotFound {
+		return fmt.Errorf("failed to delete metadata: %w", err)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return fmt.Errorf("failed to commit deletion: %w", err)
+	}
+
+	log.Printf("Deleted page entry: %s", urlHash)
+	return nil
+}
+
+// GetStats returns statistics about the database.
+func (bs *BadgerStore) GetStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+	
+	// Count total pages stored
+	pageCount := 0
+	totalCompressedSize := int64(0)
+	totalOriginalSize := int64(0)
+
+	err := bs.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		for it.Seek([]byte("meta:")); it.ValidForPrefix([]byte("meta:")); it.Next() {
+			item := it.Item()
+			value, err := item.ValueCopy(nil)
+			if err != nil {
+				continue
+			}
+
+			var meta PageMetadata
+			if err := json.Unmarshal(value, &meta); err != nil {
+				continue
+			}
+
+			pageCount++
+			totalCompressedSize += int64(meta.CompressedSize)
+			totalOriginalSize += int64(meta.SourceSize)
+		}
+		return nil
+	})
+
+	if err == nil {
+		stats["totalPages"] = pageCount
+		stats["totalCompressedSize"] = totalCompressedSize
+		stats["totalOriginalSize"] = totalOriginalSize
+		if totalOriginalSize > 0 {
+			stats["averageCompressionRatio"] = float64(totalCompressedSize) / float64(totalOriginalSize)
+		}
+	}
+
+	return stats
+}
+
+// Close closes the BadgerDB connection.
+func (bs *BadgerStore) Close() error {
+	if bs.db != nil {
+		log.Println("Closing BadgerDB...")
+		return bs.db.Close()
+	}
+	return nil
+}
+
+// compressContent compresses content using gzip.
+func compressContent(content string) ([]byte, int, int, error) {
+	originalSize := len(content)
+	var buf bytes.Buffer
+	
+	gzWriter := gzip.NewWriter(&buf)
+	defer gzWriter.Close()
+
+	if _, err := io.WriteString(gzWriter, content); err != nil {
+		return nil, 0, 0, err
+	}
+
+	if err := gzWriter.Close(); err != nil {
+		return nil, 0, 0, err
+	}
+
+	compressed := buf.Bytes()
+	return compressed, originalSize, len(compressed), nil
+}
+
+// decompressContent decompresses gzip content.
+func decompressContent(compressed []byte) (string, error) {
+	gzReader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return "", err
+	}
+	defer gzReader.Close()
+
+	decompressed, err := io.ReadAll(gzReader)
+	if err != nil {
+		return "", err
+	}
+
+	return string(decompressed), nil
+}
+
+// MigrateDataIfNeeded can be used to migrate data from old formats.
+// This is a placeholder for future use.
+func (bs *BadgerStore) MigrateDataIfNeeded() error {
+	log.Println("Checking for data migrations...")
+	// TODO: Implement migration logic if schema changes
+	return nil
+}

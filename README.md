@@ -49,6 +49,12 @@ A production-grade, event-driven web crawler with distributed architecture suppo
 ```
 
 ## 📁 Project Structure
+## Limitations 
+Crawler is currently:
+- Ignoring all cross-domain links i.e right now focused crawler (single domain)
+- Only crawling same-domain pages
+- Silently drops links when queue is full
+
 
 ```
 go-web-crawler/

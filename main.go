@@ -29,8 +29,10 @@ import (
 
 func initialUrlSeed() []string {
 	return []string{
-		"https://en.wikipedia.org/wiki/Hindus",
-		"https://www.indiatoday.in/",
+		// "https://en.wikipedia.org/wiki/Hindus",
+		// "https://www.indiatoday.in/",
+		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
+		// "http://quotes.toscrape.com", 
 	}
 }
 
@@ -349,6 +351,7 @@ func hashURL(u string) string {
 	h := sha256.Sum256([]byte(u))
 	return hex.EncodeToString(h[:])
 }
+
 func resolveURL(href string, base *url.URL) string {
 	u, err := url.Parse(href)
 	if err != nil || (u.Host != "" && u.Host != base.Host) {

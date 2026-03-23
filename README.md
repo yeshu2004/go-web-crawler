@@ -11,6 +11,12 @@ A simple and efficient web crawler written in Go. This is designed for crawling 
 - Parsing HTML and extraction of links
 - Added comments for easy work flow
 
+## Limitations 
+Crawler is currently:
+- Ignoring all cross-domain links i.e right now focused crawler (single domain)
+- Only crawling same-domain pages
+- Silently drops links when queue is full
+
 
 ## Run 
 1. **Set Up Redis Stack with Docker**:

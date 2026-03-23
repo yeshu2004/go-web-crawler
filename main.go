@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -12,196 +10,157 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-	"unicode"
 
-	"github/yeshu2004/go-epics/compress"
-	db "github/yeshu2004/go-epics/db"
-
-	"github.com/dgraph-io/badger/v4"
 	"github.com/redis/go-redis/v9"
+	db "github/yeshu2004/go-epics/db"
+	cfcrawler "github/yeshu2004/go-epics/cloudflare"
 	"golang.org/x/net/html"
 )
 
-func initialUrlSeed() []string {
-	return []string{
-		"https://en.wikipedia.org/wiki/Hindus",
-		"https://www.indiatoday.in/",
+// Crawler interface defines the contract for different crawler implementations.
+type Crawler interface {
+	Crawl(ctx context.Context, urls []string) error
+	Close() error
+}
+
+// LocalCrawler implements the Crawler interface using the original worker pool approach.
+type LocalCrawler struct {
+	workers     int
+	politeness  time.Duration
+	queue       chan string
+	wg          sync.WaitGroup
+	client      *http.Client
+	redisDB     *redis.Client
+	bloomKey    string
+	ctx         context.Context
+	cancel      context.CancelFunc
+}
+
+// NewLocalCrawler creates a new local crawler instance.
+func NewLocalCrawler(workers int, politeness time.Duration, redisClient *redis.Client, bloomKey string) *LocalCrawler {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &LocalCrawler{
+		workers:    workers,
+		politeness: politeness,
+		queue:      make(chan string, 10000),
+		client:     &http.Client{Timeout: 30 * time.Second},
+		redisDB:    redisClient,
+		bloomKey:   bloomKey,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
-type Client struct{
-	badgerDb *badger.DB
-	redisDB *redis.Client
+// Crawl starts the local crawling process.
+func (lc *LocalCrawler) Crawl(ctx context.Context, urls []string) error {
+	// Seed initial URLs
+	for _, u := range urls {
+		if !db.SeenBefore(ctx, lc.redisDB, lc.bloomKey, u) {
+			db.MarkSeen(ctx, lc.redisDB, lc.bloomKey, u)
+			select {
+			case lc.queue <- u:
+			default:
+				log.Printf("Queue full, skipping seed URL: %s", u)
+			}
+		}
+	}
+
+	// Start worker goroutines
+	for i := 0; i < lc.workers; i++ {
+		lc.wg.Add(1)
+		go lc.worker()
+	}
+
+	// Wait for all workers to complete
+	lc.wg.Wait()
+	log.Println("Local crawl completed successfully!")
+	return nil
 }
 
-var (
-	duplicateCount atomic.Int64
-	queue          = make(chan string, 10000)
-	wg             sync.WaitGroup
-	client         = &http.Client{Timeout: 30 * time.Second}
-	expected       = 10000000
-	fp_rate        = 0.001
-)
-
-const (
-	workers    = 8
-	politeness = 800 * time.Millisecond
-	bfKey      = "wiki_bf_2025"
-)
-
-func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
-	defer wg.Done()
+// worker processes URLs from the queue.
+func (lc *LocalCrawler) worker() {
+	defer lc.wg.Done()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-lc.ctx.Done():
 			return
-		case url, ok := <-queue:
+		case u, ok := <-lc.queue:
 			if !ok {
-				log.Println("worker exiting: queue closed")
+				log.Println("Worker exiting: queue closed")
 				return
 			}
 
-			time.Sleep(politeness)
+			time.Sleep(lc.politeness)
 
-			body, err := fetchBody(url) // helper function used
+			body, err := lc.fetchBody(u)
 			if err != nil {
-				log.Printf("failed %s: %v", url, err)
+				log.Printf("Failed to fetch %s: %v", u, err)
 				continue
 			}
 
-			key := hashURL(url);
-			// TODO V2: store in db
-			// we have raw body and we have to make in memory hash for itteration
-			// also we can only put the hash key if it's length is more then 2(bcz most
-			// valuable words are greater than 2 in length or say has length 3 or more)
-			// in memory hash -> key: word, value: count
-
-			// then write in memTbale -> key: word, value: [].append("hashurl"-> count);
-
-			text := extractText(body); // extracts the text from the html page
-			freqMap := buildFreqMap(text); // builds a word coud freq map 
-
-			// uncomment this, for logging purpose.
-			fmt.Println(freqMap)
-			time.Sleep(5*time.Second)
-			
-			// type Posting struct {
-			// 	URLHash string
-			// 	Freq    int
-			// }
-	
-			// var postings map[string][]Posting
-	
-			compressedBody, err := compress.GzipCompress(body);
-			if err != nil{
-				log.Fatalf("compression error: %v", err);
-			}
-
-			if err := c.badgerDb.Update(func(txn *badger.Txn) error {
-				return txn.Set([]byte(key), compressedBody);
-			}); err != nil {
-				log.Printf("failed to store in BadgerDB: %v", err)
-			}
-
-			links := extractLinks(body, url) // helper function used
+			links := lc.extractLinks(body, u)
 
 			for _, link := range links {
-				// bloom filter check, if present skip-> for matrix
-				hashed := hashURL(link)
-				added, err := rdb.BFAdd(ctx, bfKey, hashed).Result()
-				if err != nil {
-					log.Printf("BFAdd error: %v", err)
+				if db.SeenBefore(lc.ctx, lc.redisDB, lc.bloomKey, link) {
 					continue
 				}
-
-				if !added {
-					total := duplicateCount.Add(1)
-					if total <= 100 || total%5000 == 0 {
-						log.Printf("Duplicate skipped (%d total): %s", total, link)
-					}
-					continue
-				}
+				db.MarkSeen(lc.ctx, lc.redisDB, lc.bloomKey, link)
 
 				select {
-				case <-ctx.Done():
+				case <-lc.ctx.Done():
 					return
-				case queue <- link: // pushes link in queue
+				case lc.queue <- link:
 				default:
 				}
 			}
-			log.Printf("Extracted %d links from %s", len(links), url)
-
+			log.Printf("Extracted %d links from %s", len(links), u)
 		}
 	}
 }
 
-
-
-func buildFreqMap(text string) map[string]int {
-	freqMap := make(map[string]int);
-	text = strings.ToLower(text);
-
-	reg := regexp.MustCompile(`[^\p{L}\p{N}]+`)
-	words := reg.Split(text, -1)
-
-	for _, word := range words{
-		if len(word) < 3{
-			continue;
-		}
-
-		hasVaildLetter := false;
-		for _, r := range word{
-			if unicode.IsLetter(r){
-				hasVaildLetter = true;
-			}
-		}
-
-		if hasVaildLetter{
-			freqMap[word]++;
-		}
+// fetchBody retrieves the body of a URL with security validations.
+func (lc *LocalCrawler) fetchBody(u string) ([]byte, error) {
+	// Load config for security validation
+	config, err := LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	return freqMap;
-}
-
-func extractText(body []byte) string{
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil{
-		log.Printf(err.Error());
-		return ""
+	// Validate URL to prevent SSRF
+	parsedURL, err := url.Parse(u)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
-
-	var textBuilder strings.Builder
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			textBuilder.WriteString(n.Data)
-			textBuilder.WriteString(" ")
-		}
-		if n.Type == html.ElementNode && (n.Data == "script" || n.Data == "style") {
-			return
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+	
+	// Only allow HTTP/HTTPS schemes
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme: %s", parsedURL.Scheme)
+	}
+	
+	// Validate against allowed domains
+	allowed := false
+	for _, domain := range config.AllowedDomains {
+		if strings.Contains(parsedURL.Host, domain) {
+			allowed = true
+			break
 		}
 	}
-	walk(doc)
-	return textBuilder.String()
-}
+	if !allowed {
+		return nil, fmt.Errorf("domain not allowed: %s", parsedURL.Host)
+	}
 
-// fetchBody returen the []byte i.e. res.Body and err if required,
-// initally the req is send to link(string).
-func fetchBody(u string) ([]byte, error) {
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "MyCollageProjectCrawler (https://github.com/yourname/my-crawler; yourname@example.com)")
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("User-Agent", config.CrawlerUserAgent)
 
-	res, err := client.Do(req)
+	res, err := lc.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -215,8 +174,8 @@ func fetchBody(u string) ([]byte, error) {
 	return io.ReadAll(res.Body)
 }
 
-// parses the HTML doc and returns the slice of links extracted.
-func extractLinks(body []byte, baseURLStr string) []string {
+// extractLinks parses HTML and extracts all Wikipedia links.
+func (lc *LocalCrawler) extractLinks(body []byte, baseURLStr string) []string {
 	base, _ := url.Parse(baseURLStr)
 	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
@@ -229,10 +188,8 @@ func extractLinks(body []byte, baseURLStr string) []string {
 		if n.Type == html.ElementNode && n.Data == "a" {
 			for _, a := range n.Attr {
 				if a.Key == "href" {
-					if full := resolveURL(a.Val, base); full != "" {
-						if full != "" {
-							links = append(links, full)
-						}
+					if full := lc.resolveURL(a.Val, base); full != "" && strings.Contains(full, "wikipedia.org") {
+						links = append(links, full)
 					}
 				}
 			}
@@ -245,33 +202,8 @@ func extractLinks(body []byte, baseURLStr string) []string {
 	return links
 }
 
-// Check's if Bloom Filter has the url(Redis).
-func seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
-	hash := hashURL(url)
-	exists, err := rdb.BFExists(ctx, bfKey, hash).Result()
-	if err != nil {
-		if ctx.Err() == context.Canceled {
-			return true
-		}
-		log.Printf("BFExists error: %v", err)
-		return true
-	}
-	return exists
-}
-
-// marks the url in Bloom Filter(Redis).
-func markSeen(ctx context.Context, rdb *redis.Client, url string) {
-	hash := hashURL(url)
-	if err := rdb.BFAdd(ctx, bfKey, hash).Err(); err != nil {
-		log.Printf("BFAdd failed for %s: %v", url, err)
-	}
-}
-
-func hashURL(u string) string {
-	h := sha256.Sum256([]byte(u))
-	return hex.EncodeToString(h[:])
-}
-func resolveURL(href string, base *url.URL) string {
+// resolveURL converts relative URLs to absolute ones and filters by scheme/host.
+func (lc *LocalCrawler) resolveURL(href string, base *url.URL) string {
 	u, err := url.Parse(href)
 	if err != nil || (u.Host != "" && u.Host != base.Host) {
 		return ""
@@ -282,63 +214,127 @@ func resolveURL(href string, base *url.URL) string {
 	}
 	resolved.Fragment = ""
 	resolved.RawQuery = ""
-	resolved.Path = strings.ToLower(resolved.Path)
-	if resolved.Path != "" && !strings.HasSuffix(resolved.Path, "/") {
-		resolved.Path = strings.TrimSuffix(resolved.Path, "/")
-	}
 	return resolved.String()
+}
+
+// Close cleans up local crawler resources.
+func (lc *LocalCrawler) Close() error {
+	lc.cancel()
+	close(lc.queue)
+	return nil
+}
+
+// initialUrlSeed returns the seed URLs for crawling.
+func initialUrlSeed() []string {
+	config, err := LoadConfig()
+	if err != nil {
+		log.Printf("Failed to load config, using defaults: %v", err)
+		return []string{
+			"https://en.wikipedia.org/wiki/Ramayana",
+			"https://en.wikipedia.org/wiki/Jai_Shri_Ram",
+		}
+	}
+
+	// Generate seed URLs from allowed domains
+	var seedURLs []string
+	for _, domain := range config.AllowedDomains {
+		if strings.Contains(domain, "wikipedia.org") {
+			seedURLs = append(seedURLs, 
+				"https://en.wikipedia.org/wiki/Ramayana",
+				"https://en.wikipedia.org/wiki/Jai_Shri_Ram",
+				"https://en.wikipedia.org/wiki/Mahabharata",
+				"https://en.wikipedia.org/wiki/Hanuman",
+			)
+		} else if strings.Contains(domain, "indiatoday.in") {
+			seedURLs = append(seedURLs, "https://www.indiatoday.in/")
+		}
+	}
+
+	if len(seedURLs) == 0 {
+		// Fallback to default
+		seedURLs = []string{"https://en.wikipedia.org/wiki/Ramayana"}
+	}
+
+	return seedURLs
+}
+
+// getCrawlerEngine instantiates the appropriate crawler based on configuration.
+func getCrawlerEngine(engine string, rdb *redis.Client, bloomKey string) (Crawler, error) {
+	config, err := LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	switch strings.ToLower(engine) {
+	case "cloudflare":
+		cfConfig := cfcrawler.CrawlerConfig{
+			APIToken:       config.CloudflareAPIToken,
+			AccountID:      config.CloudflareAccountID,
+			PollInterval:   config.CloudflarePollInterval,
+			MaxWaitTime:    config.CloudflareMaxWaitTime,
+			ReturnFormat:   "markdown",
+			AllowedDomains: config.AllowedDomains,
+			MaxPages:       config.MaxPages,
+		}
+
+		crawler := cfcrawler.NewCrawler(cfConfig, rdb, bloomKey)
+		return Crawler(crawler), nil
+
+	case "local", "":
+		return NewLocalCrawler(config.CrawlerWorkers, config.CrawlerPoliteness, rdb, bloomKey), nil
+
+	default:
+		return nil, fmt.Errorf("unknown crawler engine: %s", engine)
+	}
 }
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// redis connection
+	// Load configuration
+	config, err := LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Initialize Redis
 	rdb, err := db.RedisInit(ctx)
 	if err != nil {
 		log.Fatal("Redis connection failed:", err)
 	}
 	defer rdb.Close()
 
-	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
+	// Initialize Bloom Filter
+	bfKey := "wiki_bf_2025"
+	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, 0.001, 100000); err != nil {
 		log.Fatal("Bloom filter init failed:", err)
-	}	
+	}
 
-	// badgerDB connection
-	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"));
+	// Instantiate the appropriate crawler
+	crawler, err := getCrawlerEngine(config.CrawlerEngine, rdb, bfKey)
 	if err != nil {
-		log.Fatal("BadgerDB connection failed:", err)
+		log.Fatalf("Failed to initialize crawler: %v", err)
 	}
-	defer baddgerDB.Close()
+	defer crawler.Close()
 
-	cli := &Client{
-		badgerDb: baddgerDB,
-		redisDB: rdb,
-	}
-
-	// handle graceful shutdown
+	// Graceful shutdown handler
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
 		<-c
 		log.Println("\nShutting down gracefully...")
 		cancel()
-		close(queue)
+		crawler.Close()
+		os.Exit(0)
 	}()
 
-	for _, seed := range initialUrlSeed() {
-		if !seenBefore(ctx, rdb, seed) {
-			markSeen(ctx, rdb, seed)
-			queue <- seed
-		}
-	}
+	// Get seed URLs
+	seedURLs := initialUrlSeed()
+	log.Printf("Starting %s crawler with %d seed URLs", config.CrawlerEngine, len(seedURLs))
 
-	// start workers
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go cli.worker(ctx, rdb) // <- entry point for worker
+	// Start crawling
+	if err := crawler.Crawl(ctx, seedURLs); err != nil {
+		log.Fatalf("Crawl failed: %v", err)
 	}
-
-	wg.Wait()
-	log.Println("Crawl completed successfully!")
 }

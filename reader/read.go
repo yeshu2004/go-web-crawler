@@ -43,11 +43,15 @@ func main() {
 			}
 
 			filename := fmt.Sprintf("page_%d.html", i)
-			if err := os.WriteFile(filename, htmlBytes, 0644); err != nil {
+			// Use secure file permissions (0600 = read/write for owner only)
+			if err := os.WriteFile(filename, htmlBytes, 0600); err != nil {
 				return err
 			}
 
-			fmt.Println("Saved:", filename)
+			// Sanitize filename for logging to prevent log injection
+			safeFilename := strings.ReplaceAll(filename, "\n", "")
+			safeFilename = strings.ReplaceAll(safeFilename, "\r", "")
+			fmt.Printf("Saved: %s\n", safeFilename)
 
 			i++
 			// if i == 3 { // export first 3 pages

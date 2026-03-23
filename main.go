@@ -34,9 +34,9 @@ func initialUrlSeed() []string {
 	}
 }
 
-type Client struct{
+type Client struct {
 	badgerDb *badger.DB
-	redisDB *redis.Client
+	redisDB  *redis.Client
 }
 
 var (
@@ -54,7 +54,7 @@ const (
 	bfKey      = "wiki_bf_2025"
 )
 
-func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
+func (c *Client) worker(ctx context.Context, rdb *redis.Client) {
 	defer wg.Done()
 
 	for {
@@ -75,7 +75,7 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 				continue
 			}
 
-			key := hashURL(url);
+			key := hashURL(url)
 			// TODO V2: store in db
 			// we have raw body and we have to make in memory hash for itteration
 			// also we can only put the hash key if it's length is more then 2(bcz most
@@ -84,27 +84,27 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 
 			// then write in memTbale -> key: word, value: [].append("hashurl"-> count);
 
-			text := extractText(body); // extracts the text from the html page
-			freqMap := buildFreqMap(text); // builds a word coud freq map 
+			text := extractText(body)     // extracts the text from the html page
+			freqMap := buildFreqMap(text) // builds a word coud freq map
 
 			// uncomment this, for logging purpose.
 			fmt.Println(freqMap)
-			time.Sleep(5*time.Second)
-			
+			time.Sleep(5 * time.Second)
+
 			// type Posting struct {
 			// 	URLHash string
 			// 	Freq    int
 			// }
-	
+
 			// var postings map[string][]Posting
-	
-			compressedBody, err := compress.GzipCompress(body);
-			if err != nil{
-				log.Fatalf("compression error: %v", err);
+
+			compressedBody, err := compress.GzipCompress(body)
+			if err != nil {
+				log.Fatalf("compression error: %v", err)
 			}
 
 			if err := c.badgerDb.Update(func(txn *badger.Txn) error {
-				return txn.Set([]byte(key), compressedBody);
+				return txn.Set([]byte(key), compressedBody)
 			}); err != nil {
 				log.Printf("failed to store in BadgerDB: %v", err)
 			}
@@ -141,39 +141,37 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 	}
 }
 
-
-
 func buildFreqMap(text string) map[string]int {
-	freqMap := make(map[string]int);
-	text = strings.ToLower(text);
+	freqMap := make(map[string]int)
+	text = strings.ToLower(text)
 
 	reg := regexp.MustCompile(`[^\p{L}\p{N}]+`)
 	words := reg.Split(text, -1)
 
-	for _, word := range words{
-		if len(word) < 3{
-			continue;
+	for _, word := range words {
+		if len(word) < 3 {
+			continue
 		}
 
-		hasVaildLetter := false;
-		for _, r := range word{
-			if unicode.IsLetter(r){
-				hasVaildLetter = true;
+		hasVaildLetter := false
+		for _, r := range word {
+			if unicode.IsLetter(r) {
+				hasVaildLetter = true
 			}
 		}
 
-		if hasVaildLetter{
-			freqMap[word]++;
+		if hasVaildLetter {
+			freqMap[word]++
 		}
 	}
 
-	return freqMap;
+	return freqMap
 }
 
-func extractText(body []byte) string{
+func extractText(body []byte) string {
 	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil{
-		log.Printf(err.Error());
+	if err != nil {
+		log.Print(err)
 		return ""
 	}
 
@@ -198,8 +196,21 @@ func extractText(body []byte) string{
 // fetchBody returen the []byte i.e. res.Body and err if required,
 // initally the req is send to link(string).
 func fetchBody(u string) ([]byte, error) {
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "MyCollageProjectCrawler (https://github.com/yourname/my-crawler; yourname@example.com)")
+	// SSRF Protection: Validate URL before making request
+	if err := validateURL(u); err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Use configurable User-Agent instead of hardcoded credentials
+	userAgent := os.Getenv("CRAWLER_USER_AGENT")
+	if userAgent == "" {
+		userAgent = "go-web-crawler/2.0 (+https://github.com/example/crawler)"
+	}
+	req.Header.Set("User-Agent", userAgent)
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -211,8 +222,77 @@ func fetchBody(u string) ([]byte, error) {
 		return nil, fmt.Errorf("status %d", res.StatusCode)
 	}
 
-	log.Printf("Crawled: %s", u)
+	// Sanitize URL for logging to prevent log injection
+	safeURL := strings.ReplaceAll(u, "\n", "")
+	safeURL = strings.ReplaceAll(safeURL, "\r", "")
+	log.Printf("Crawled: %s", safeURL)
 	return io.ReadAll(res.Body)
+}
+
+// validateURL prevents SSRF attacks by validating URLs against allowlist
+func validateURL(u string) error {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Errorf("malformed URL: %w", err)
+	}
+
+	// Only allow HTTP/HTTPS schemes
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme: %s", parsed.Scheme)
+	}
+
+	// Block private/internal IP ranges to prevent SSRF
+	if isPrivateOrLocalhost(parsed.Host) {
+		return fmt.Errorf("private/internal host not allowed: %s", parsed.Host)
+	}
+
+	// Allowlist of permitted domains (add more as needed)
+	allowedDomains := []string{
+		"en.wikipedia.org",
+		"www.indiatoday.in",
+		"wikipedia.org",
+		"indiatoday.in",
+	}
+
+	for _, domain := range allowedDomains {
+		if strings.HasSuffix(parsed.Host, domain) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("domain not in allowlist: %s", parsed.Host)
+}
+
+// isPrivateOrLocalhost checks if host is private/internal IP or localhost
+func isPrivateOrLocalhost(host string) bool {
+	// Remove port if present
+	if colonIndex := strings.LastIndex(host, ":"); colonIndex != -1 {
+		host = host[:colonIndex]
+	}
+
+	// Check for localhost variants
+	localHosts := []string{"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+	for _, local := range localHosts {
+		if host == local {
+			return true
+		}
+	}
+
+	// Check for private IP ranges (simplified check)
+	privateRanges := []string{
+		"10.",      // 10.0.0.0/8
+		"172.16.",  // 172.16.0.0/12 (simplified)
+		"192.168.", // 192.168.0.0/16
+		"169.254.", // Link-local
+	}
+
+	for _, prefix := range privateRanges {
+		if strings.HasPrefix(host, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // parses the HTML doc and returns the slice of links extracted.
@@ -230,9 +310,7 @@ func extractLinks(body []byte, baseURLStr string) []string {
 			for _, a := range n.Attr {
 				if a.Key == "href" {
 					if full := resolveURL(a.Val, base); full != "" {
-						if full != "" {
-							links = append(links, full)
-						}
+						links = append(links, full)
 					}
 				}
 			}
@@ -302,10 +380,10 @@ func main() {
 
 	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
 		log.Fatal("Bloom filter init failed:", err)
-	}	
+	}
 
 	// badgerDB connection
-	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"));
+	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"))
 	if err != nil {
 		log.Fatal("BadgerDB connection failed:", err)
 	}
@@ -313,7 +391,7 @@ func main() {
 
 	cli := &Client{
 		badgerDb: baddgerDB,
-		redisDB: rdb,
+		redisDB:  rdb,
 	}
 
 	// handle graceful shutdown

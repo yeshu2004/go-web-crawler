@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github/yeshu2004/go-epics/pkg/models"
 
@@ -30,7 +31,12 @@ func (p *NATSProducer) Publish(ctx context.Context, event *models.PostingEvent) 
 	if err := p.nc.Publish(p.subject, payload); err != nil {
 		return err
 	}
-	return p.nc.FlushWithContext(ctx)
+	
+	// Create context with timeout for NATS flush
+	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	
+	return p.nc.FlushWithContext(flushCtx)
 }
 
 func (p *NATSProducer) Close() error {

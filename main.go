@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -21,24 +22,37 @@ import (
 
 	"github/yeshu2004/go-epics/compress"
 	db "github/yeshu2004/go-epics/db"
+	tp "github/yeshu2004/go-epics/types"
+	"github/yeshu2004/go-epics/nats"
+
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/html"
 )
 
+
+func newTupleEvent(w string, c int, url string) *tp.TupleEvent{
+	return &tp.TupleEvent{
+		Word: w,
+		Count: c,
+		URLHash: url,
+	}
+}
+
 func initialUrlSeed() []string {
 	return []string{
 		// "https://en.wikipedia.org/wiki/Hindus",
 		// "https://www.indiatoday.in/",
 		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
-		// "http://quotes.toscrape.com", 
+		"http://quotes.toscrape.com",
 	}
 }
 
-type Client struct{
+type Client struct {
 	badgerDb *badger.DB
-	redisDB *redis.Client
+	redisDB  *redis.Client
+	nats 	*nats.Client
 }
 
 var (
@@ -52,11 +66,12 @@ var (
 
 const (
 	workers    = 8
+	indexerWorkers   = 4
 	politeness = 800 * time.Millisecond
 	bfKey      = "wiki_bf_2025"
 )
 
-func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
+func (c *Client) worker(ctx context.Context, rdb *redis.Client) {
 	defer wg.Done()
 
 	for {
@@ -77,8 +92,8 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 				continue
 			}
 
-			key := hashURL(url);
-			// TODO V2: store in db
+			key := hashURL(url)
+
 			// we have raw body and we have to make in memory hash for itteration
 			// also we can only put the hash key if it's length is more then 2(bcz most
 			// valuable words are greater than 2 in length or say has length 3 or more)
@@ -86,30 +101,49 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 
 			// then write in memTbale -> key: word, value: [].append("hashurl"-> count);
 
-			text := extractText(body); // extracts the text from the html page
-			if len(text) == 0{
-				
+			text := extractText(body) // extracts the text from the html page
+			if len(text) == 0 {
+
 			}
-			freqMap := buildFreqMap(text); // builds a word coud freq map 
+
+			// IDEA 1:
+
+			// what if i docouple here and push every text to a message queue and then consume it
+			// i.e push evry word/text into the NATS stream and then we would have have workers like
+			// 4 diffent workers, each woker having word range like w1-> char 'a' to 'g' and so on
+			// Then each worker would build Freq Map and then would buffer in memory and then push into
+			// DB, updating the DB freq, like information retrival
+
+			freqMap := buildFreqMap(text) // builds a word coud freq map
+			if err := c.publishTuple(ctx, freqMap, key); err != nil{  // IDEA 3
+				log.Fatalln(err);
+			}
+
+			// IDEA 2:
+
+			// push freq map in a message queue and then each woker would have to consume the freq map
+			// from the queue based on sharding logic and then they would buffer and combine multiple
+			// message queue in memory and when each server reaches 60% memory or after 10sec each worker
+			// has to update the freq of each word present in buffer into the DB
 
 			// uncomment this, for logging purpose.
 			fmt.Println(freqMap)
 			// time.Sleep(5*time.Second)
-			
+
 			// type Posting struct {
 			// 	URLHash string
 			// 	Freq    int
 			// }
-	
+
 			// var postings map[string][]Posting
-	
-			compressedBody, err := compress.GzipCompress(body);
-			if err != nil{
-				log.Fatalf("compression error: %v", err);
+
+			compressedBody, err := compress.GzipCompress(body)
+			if err != nil {
+				log.Fatalf("compression error: %v", err)
 			}
 
 			if err := c.badgerDb.Update(func(txn *badger.Txn) error {
-				return txn.Set([]byte(key), compressedBody);
+				return txn.Set([]byte(key), compressedBody)
 			}); err != nil {
 				log.Printf("failed to store in BadgerDB: %v", err)
 			}
@@ -146,39 +180,66 @@ func (c *Client)worker(ctx context.Context, rdb *redis.Client) {
 	}
 }
 
+func (c *Client) publishTuple(ctx context.Context,freqMap map[string]int, URLHash string) error {
+	for word, count := range freqMap {
+		partitionID := partitionFor(word, indexerWorkers)
 
+		tuple := newTupleEvent(word, count, URLHash);
+		b, err := json.Marshal(tuple);
+		if err != nil{
+			return fmt.Errorf("error in tuple byte conversion: %v", err);
+		}
+
+		if err := c.nats.PublishTupleEvent(ctx, partitionID, b); err != nil{
+			return fmt.Errorf("url(%s) tuple publish error: %v", URLHash, err)
+		}
+
+		log.Printf("Word (%s), Freq (%d) publish to partitionID:%d \n", tuple.Word, tuple.Count, partitionID);
+	}
+	return nil;
+}
+
+// partitionFor returns the indexer partition index for a given word.
+// hash(word) % n — deterministic, so the same word always lands on the same worker.
+func partitionFor(word string, n int) int {
+	h := sha256.Sum256([]byte(word))
+	// Use first 8 bytes as uint64 to avoid bias
+	v := uint64(h[0])<<56 | uint64(h[1])<<48 | uint64(h[2])<<40 | uint64(h[3])<<32 |
+		uint64(h[4])<<24 | uint64(h[5])<<16 | uint64(h[6])<<8 | uint64(h[7])
+	return int(v % uint64(n))
+}
 
 func buildFreqMap(text string) map[string]int {
-	freqMap := make(map[string]int);
-	text = strings.ToLower(text);
+	freqMap := make(map[string]int)
+	text = strings.ToLower(text)
 
 	reg := regexp.MustCompile(`[^\p{L}\p{N}]+`)
 	words := reg.Split(text, -1)
 
-	for _, word := range words{
-		if len(word) < 3{
-			continue;
+	for _, word := range words {
+		if len(word) < 3 {
+			continue
 		}
 
-		hasVaildLetter := false;
-		for _, r := range word{
-			if unicode.IsLetter(r){
-				hasVaildLetter = true;
+		hasVaildLetter := false
+		for _, r := range word {
+			if unicode.IsLetter(r) {
+				hasVaildLetter = true
 			}
 		}
 
-		if hasVaildLetter{
-			freqMap[word]++;
+		if hasVaildLetter {
+			freqMap[word]++
 		}
 	}
 
-	return freqMap;
+	return freqMap
 }
 
-func extractText(body []byte) string{
+func extractText(body []byte) string {
 	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil{
-		log.Printf(err.Error());
+	if err != nil {
+		log.Println(err)
 		return ""
 	}
 
@@ -308,18 +369,30 @@ func main() {
 
 	if err := db.InitializeBloomFilter(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
 		log.Fatal("Bloom filter init failed:", err)
-	}	
+	}
 
 	// badgerDB connection
-	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"));
+	baddgerDB, err := badger.Open(badger.LSMOnlyOptions("./crwal_db"))
 	if err != nil {
 		log.Fatal("BadgerDB connection failed:", err)
 	}
 	defer baddgerDB.Close()
 
+	// NATS connection
+	nats , err := nats.NewNATSConn();
+	if err != nil {
+		log.Fatal("Nats connection failed:", err)
+	}
+
+	if err := nats.CreateTupleStream(ctx); err != nil{
+		log.Println(err);
+	}
+	log.Println("Nats Tuple Stream connection sucessfull...")
+
 	cli := &Client{
 		badgerDb: baddgerDB,
-		redisDB: rdb,
+		redisDB:  rdb,
+		nats: nats,
 	}
 
 	// handle graceful shutdown

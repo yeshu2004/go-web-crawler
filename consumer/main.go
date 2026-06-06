@@ -36,13 +36,14 @@ func main() {
 	for i := 0; i < NATS.NumPartitions; i++ {
 		wg.Add(1)
 		go func(id int) {
-			defer wg.Done()
+			defer wg.Done() // if we don't add wg then all consumer will 
+			// exit immediately i.e. killing all goroutines.
 			if err := nc.StartConsumer(ctx, id); err != nil {
 				log.Printf("[consumer-%d] exited with error: %v", id, err)
 			}
 		}(i)
 	}
 
-	wg.Wait()
+	wg.Wait() // so that all consumer are running util gracefull shut down is done by the user
 	log.Println("all consumers stopped")
 }

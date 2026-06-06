@@ -17,6 +17,33 @@ Crawler is currently:
 - Only crawling same-domain pages
 - Silently drops links when queue is full
 
+## PostgresSQL Setup Docker
+```bash
+  docker run --name my-postgres -e POSTGRES_PASSWORD=yeshu2004 -p 5432:5432 -d postgres
+```
+```bash
+  docker exec -it my-postgres psql -U postgres 
+```
+```bash
+  CREATE DATABASE tupledb;
+```
+```bash
+  \l
+```
+```bash
+  \c tupledb
+```
+```bash
+  CREATE TABLE word_counts (
+    id SERIAL PRIMARY KEY,
+    word TEXT NOT NULL,
+    count BIGINT NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW()
+  );
+```
+
+
+
 
 ## Run 
 1. **Set Up Redis Stack with Docker**:

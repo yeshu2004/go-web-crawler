@@ -18,6 +18,7 @@ const (
 	streamName     = "TUPLE"
 	streamSubjects = "TUPLE.*"
 	NumPartitions  = 4
+	batchSize      = 1000
 )
 
 type Client struct {
@@ -81,9 +82,14 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 	if err != nil {
 		return fmt.Errorf("create consumer partition %d: %w", partitionID, err)
 	}
-
 	log.Printf("[consumer-%d] ready on subject %s", partitionID, partitionSubject(partitionID))
 
+	
+	// initilize the batch and count size
+	tupleBatch := make(map[string]int, batchSize) // pre allocate the map of batchsize 
+	count := 0
+	
+	// starts consuming the tuple events
 	for {
 		select {
 		case <-ctx.Done():
@@ -99,26 +105,42 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 			}
 
 			for msg := range msgs.Messages() {
-				if err := c.processTuple(ctx, partitionID, msg.Data()); err != nil {
+				// process the tuple event and add it into the map & update count
+				updatedCount, err := c.processTuple(partitionID, msg.Data(), tupleBatch, count);
+				if err != nil {
 					log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
-					msg.Nak()
-					continue
+					msg.Nak();
+					continue;
 				}
-				msg.Ack()
+				count = updatedCount; // update the count 
+				msg.Ack();
+
+				// flush it into DB
+				if count >= batchSize{
+					log.Printf("[consumer-%d] count=%d map=%v\n\n", partitionID, count, tupleBatch);
+					tupleBatch = make(map[string]int, batchSize);
+					count = 0;
+				}
 			}
 		}
 	}
 }
 
-func (c *Client) processTuple(ctx context.Context, partitionID int, b []byte) error {
+
+func (c *Client) processTuple(partitionID int, b []byte, tupleBatch map[string]int, count int) (int, error) {
 	var t types.TupleEvent
 	if err := json.Unmarshal(b, &t); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+		return count, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	// TODO: replace with buffer accumulation + Postgres flush
 	log.Printf("[consumer-%d] word=%s freq=%d url=%s", partitionID, t.Word, t.Count, t.URLHash)
-	return nil
+
+	// Q! why are we actually having urlHash in msg event ? do we need it ?
+
+	tupleBatch[t.Word] += t.Count // default value is 0
+	count++
+
+	return count, nil;
 }
 
 func partitionSubject(id int) string {

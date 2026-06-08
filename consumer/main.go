@@ -23,7 +23,7 @@ func main() {
 		cancel()
 	}()
 
-	nc, err := NATS.NewNATSConn()
+	nc, err := NATS.NewNATSANDPGConn()
 	if err != nil {
 		log.Fatal("nats connect:", err)
 	}
@@ -47,3 +47,4 @@ func main() {
 	wg.Wait() // so that all consumer are running util gracefull shut down is done by the user
 	log.Println("all consumers stopped")
 }
+

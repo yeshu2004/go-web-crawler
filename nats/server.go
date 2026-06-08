@@ -2,12 +2,14 @@ package nats
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github/yeshu2004/go-epics/db"
 	"github/yeshu2004/go-epics/types"
 
 	natsclient "github.com/nats-io/nats.go"
@@ -23,9 +25,10 @@ const (
 
 type Client struct {
 	js jetstream.JetStream
+	pg *sql.DB
 }
 
-func NewNATSConn() (*Client, error) {
+func NewNATSANDPGConn() (*Client, error) {
 	conn, err := natsclient.Connect(natsclient.DefaultURL)
 	if err != nil {
 		return nil, fmt.Errorf("nats connection: %w", err)
@@ -36,7 +39,13 @@ func NewNATSConn() (*Client, error) {
 		return nil, fmt.Errorf("jetstream init: %w", err)
 	}
 
-	return &Client{js: js}, nil
+	pg, err := db.ConnectPostgresSQl()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("PGSQL connected....")
+
+	return &Client{js: js, pg: pg}, nil
 }
 
 func (c *Client) CreateTupleStream(ctx context.Context) error {
@@ -84,15 +93,25 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 	}
 	log.Printf("[consumer-%d] ready on subject %s", partitionID, partitionSubject(partitionID))
 
-	
 	// initilize the batch and count size
-	tupleBatch := make(map[string]int, batchSize) // pre allocate the map of batchsize 
+	tupleBatch := make(map[string]int, batchSize) // pre allocate the map of batchsize
 	count := 0
-	
+
 	// starts consuming the tuple events
 	for {
 		select {
 		case <-ctx.Done():
+			// flush the remaining tuple
+			if len(tupleBatch) > 0 {
+				log.Printf("[consumer-%d] flushing the tuple batch", partitionID)
+				if err := c.flushDB(tupleBatch); err != nil {
+					log.Printf("flushDB FAILED: %v", err)
+					continue
+				}
+				log.Printf("[consumer-%d] flushed - %d words", partitionID, len(tupleBatch))
+				tupleBatch = make(map[string]int, batchSize)
+				count = 0
+			}
 			log.Printf("[consumer-%d] shutting down", partitionID)
 			return nil
 		default:
@@ -106,26 +125,57 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 
 			for msg := range msgs.Messages() {
 				// process the tuple event and add it into the map & update count
-				updatedCount, err := c.processTuple(partitionID, msg.Data(), tupleBatch, count);
+				updatedCount, err := c.processTuple(partitionID, msg.Data(), tupleBatch, count)
 				if err != nil {
 					log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
-					msg.Nak();
-					continue;
+					msg.Nak()
+					continue
 				}
-				count = updatedCount; // update the count 
-				msg.Ack();
+				count = updatedCount // update the count
+				// msg.Ack();
 
 				// flush it into DB
-				if count >= batchSize{
-					log.Printf("[consumer-%d] count=%d map=%v\n\n", partitionID, count, tupleBatch);
-					tupleBatch = make(map[string]int, batchSize);
-					count = 0;
+				if count >= batchSize {
+					log.Printf("[consumer-%d] count=%d mapLen=%v\n\n", partitionID, count, len(tupleBatch))
+					// flush
+					if err := c.flushDB(tupleBatch); err != nil {
+						log.Printf("flush failed: %v", err)
+						msg.Nak()
+						continue
+
+					}
+					// reset
+					tupleBatch = make(map[string]int, batchSize)
+					count = 0
 				}
+
+				msg.Ack()
 			}
 		}
 	}
 }
 
+func (c *Client) flushDB(batch map[string]int) error {
+	tx, err := c.pg.Begin();
+	if err != nil {
+		return err
+	}
+
+	query := `INSERT INTO word_counts(word, count) VALUES ($1, $2) ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count`;
+	
+	log.Printf("flushing %d records to DB", len(batch))
+
+	for word, count := range batch {
+		_, err := tx.Exec(query, word, count)
+
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	log.Printf("flushed %d records to DB", len(batch))
+	return tx.Commit()
+}
 
 func (c *Client) processTuple(partitionID int, b []byte, tupleBatch map[string]int, count int) (int, error) {
 	var t types.TupleEvent
@@ -136,11 +186,10 @@ func (c *Client) processTuple(partitionID int, b []byte, tupleBatch map[string]i
 	log.Printf("[consumer-%d] word=%s freq=%d url=%s", partitionID, t.Word, t.Count, t.URLHash)
 
 	// Q! why are we actually having urlHash in msg event ? do we need it ?
-
 	tupleBatch[t.Word] += t.Count // default value is 0
 	count++
 
-	return count, nil;
+	return count, nil
 }
 
 func partitionSubject(id int) string {

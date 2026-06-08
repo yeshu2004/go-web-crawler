@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -43,8 +42,8 @@ func initialUrlSeed() []string {
 	return []string{
 		// "https://en.wikipedia.org/wiki/Hindus",
 		// "https://www.indiatoday.in/",
-		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
-		"http://quotes.toscrape.com",
+		"http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
+		// "http://quotes.toscrape.com",
 	}
 }
 
@@ -52,7 +51,6 @@ type Client struct {
 	badgerDb *badger.DB
 	redisDB  *redis.Client
 	nats     *nats.Client
-	pg       *sql.DB
 }
 
 var (
@@ -349,8 +347,8 @@ func main() {
 	}
 	defer baddgerDB.Close()
 
-	// NATS connection
-	nats, err := nats.NewNATSConn()
+	// NATS AND PG connection
+	nats, err := nats.NewNATSANDPGConn()
 	if err != nil {
 		log.Fatal("Nats connection failed:", err)
 	}
@@ -361,13 +359,10 @@ func main() {
 	}
 	log.Println("Nats Tuple Stream connection sucessfull...")
 
-	pg, err := db.ConnectPostgresSQl()
-
 	cli := &Client{
 		badgerDb: baddgerDB,
 		redisDB:  rdb,
 		nats:     nats,
-		pg:       pg,
 	}
 
 	// handle graceful shutdown

@@ -35,8 +35,8 @@ Crawler is currently:
 ```
 ```bash
   CREATE TABLE word_counts (
-    id SERIAL PRIMARY KEY,
-    word TEXT NOT NULL,
+    id SERIAL,
+    word TEXT NOT NULL PRIMARY KEY,
     count BIGINT NOT NULL,
     updated_at TIMESTAMP DEFAULT NOW()
   );

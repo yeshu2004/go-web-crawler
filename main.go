@@ -40,9 +40,9 @@ func newTupleEvent(w string, c int, url string) *tp.TupleEvent {
 
 func initialUrlSeed() []string {
 	return []string{
-		// "https://en.wikipedia.org/wiki/Hindus",
+		"https://en.wikipedia.org/wiki/Hindus",
 		// "https://www.indiatoday.in/",
-		"http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
+		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
 		// "http://quotes.toscrape.com",
 	}
 }

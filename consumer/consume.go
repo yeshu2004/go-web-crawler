@@ -1,28 +1,14 @@
-package main
+package consumer
 
 import (
 	"context"
 	"log"
-	"os"
-	"os/signal"
 	"sync"
 
 	NATS "github/yeshu2004/go-epics/nats"
 )
 
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Graceful shutdown on Ctrl+C
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		<-c
-		log.Println("interrupt — shutting down...")
-		cancel()
-	}()
-
+func Consume(ctx context.Context) {
 	nc, err := NATS.NewNATSANDPGConn()
 	if err != nil {
 		log.Fatal("nats connect:", err)

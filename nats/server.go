@@ -161,7 +161,7 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 }
 
 func (c *Client) flushWithRetry(ctx context.Context,batch map[string]int, partitionID int) {
-	for i :=1 ; i< flushMaxRetry; i++{
+	for i :=1 ; i<= flushMaxRetry; i++{
 		if err := c.flushDB(ctx, batch); err != nil{
 			log.Printf("[consumer-%d] flush attempt %d/%d failed: %v", partitionID, i, flushMaxRetry, err);
 

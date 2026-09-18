@@ -31,8 +31,9 @@ import (
 	"golang.org/x/net/html"
 )
 
-func newTupleEvent(w string, c int, url string) *tp.TupleEvent {
+func newTupleEvent(id string, w string, c int, url string) *tp.TupleEvent {
 	return &tp.TupleEvent{
+		Id:      id,
 		Word:    w,
 		Count:   c,
 		URLHash: url,
@@ -155,7 +156,8 @@ func (c *Crawler) publishTuple(ctx context.Context, freqMap map[string]int, URLH
 	for word, count := range freqMap {
 		partitionID := partitionFor(word, indexerWorkers)
 
-		tuple := newTupleEvent(word, count, URLHash)
+		id := uuid.New().String()
+		tuple := newTupleEvent(id, word, count, URLHash)
 		b, err := json.Marshal(tuple)
 		if err != nil {
 			return fmt.Errorf("error in tuple conversion: %v", err)
@@ -327,8 +329,7 @@ func resolveURL(href string, base *url.URL) string {
 	return resolved.String()
 }
 
-
-func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats *nats.Client) (*Crawler, error){
+func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats *nats.Client) (*Crawler, error) {
 	id := uuid.NewString()
 	bfKey := "crawler:" + id + ":bloom"
 

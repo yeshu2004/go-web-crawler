@@ -124,19 +124,19 @@ func (c *Crawler) worker(ctx context.Context) {
 			links := extractLinks(body, url) // helper function used
 
 			for _, link := range links {
-				// bloom filter check, if present skip-> for matrix
-				hashed := hashURL(link)
-				added, err := c.rdb.BFAdd(ctx, c.bfKey, hashed).Result()
+				claimed, err := c.claimURL(ctx, link)
 				if err != nil {
-					log.Printf("BFAdd error: %v", err)
+					log.Printf("failed to claim %s: %v", link, err)
 					continue
 				}
 
-				if !added {
+				if !claimed {
 					total := c.duplicateCount.Add(1)
+
 					if total <= 100 || total%5000 == 0 {
 						log.Printf("Duplicate skipped (%d total): %s", total, link)
 					}
+
 					continue
 				}
 
@@ -174,6 +174,8 @@ func (c *Crawler) publishTuple(ctx context.Context, freqMap map[string]int, URLH
 
 // partitionFor returns the indexer partition index for a given word.
 // hash(word) % n — deterministic, so the same word always lands on the same worker.
+// Q) what happend if the worker gets down i.e. change in value of n
+// Ans) consistent hashsing T.B.D
 func partitionFor(word string, n int) int {
 	h := sha256.Sum256([]byte(word))
 	// Use first 8 bytes as uint64 to avoid bias
@@ -306,6 +308,31 @@ func (c *Crawler) markSeen(ctx context.Context, rdb *redis.Client, url string) {
 	}
 }
 
+var claimURLScript = redis.NewScript(`
+    if redis.call("BF.EXISTS", KEYS[1], ARGV[1]) == 0 then
+        redis.call("BF.ADD", KEYS[1], ARGV[1])
+        return 1
+    end
+
+    return 0
+`)
+
+func (c *Crawler) claimURL(ctx context.Context, url string) (bool, error) {
+	hash := hashURL(url)
+
+	result, err := claimURLScript.Run(ctx, c.rdb, []string{c.bfKey}, hash).Int()
+
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+
+		return false, fmt.Errorf("failed to claim URL: %w", err)
+	}
+
+	return result == 1, nil
+}
+
 func hashURL(u string) string {
 	h := sha256.Sum256([]byte(u))
 	return hex.EncodeToString(h[:])
@@ -350,8 +377,22 @@ func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats 
 
 func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 	for _, seed := range urlSeeds {
-		if !c.seenBefore(ctx, c.rdb, seed) {
-			c.markSeen(ctx, c.rdb, seed)
+		// if !c.seenBefore(ctx, c.rdb, seed) {
+		// 	c.markSeen(ctx, c.rdb, seed)
+		// 	select {
+		// 	case c.queue <- seed:
+		// 	case <-ctx.Done():
+		// 		return
+		// 	}
+		// }
+
+		claimed, err := c.claimURL(ctx, seed)
+		if err != nil {
+			log.Printf("failed to claim seed %s: %v", seed, err)
+			return
+		}
+
+		if claimed {
 			select {
 			case c.queue <- seed:
 			case <-ctx.Done():

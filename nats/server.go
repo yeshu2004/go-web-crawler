@@ -21,7 +21,8 @@ const (
 	streamSubjects = "TUPLE.*"
 	NumPartitions  = 4
 	batchSize      = 1000
-	flushMaxRetry = 3
+	flushMaxRetry  = 3
+	flushInterval  = 5 * time.Second
 )
 
 type Client struct {
@@ -94,8 +95,15 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 	}
 	log.Printf("[consumer-%d] ready on subject %s", partitionID, partitionSubject(partitionID))
 
+	return c.consume(ctx, consumer, partitionID);
+}
+
+func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, partitionID int) error {
 	// initilize the batch and count size
 	tupleBatch := make(map[string]int, batchSize) // pre allocate the map of batchsize
+	var pendingMsgs []jetstream.Msg
+	pendingCount := 0
+	var lastFlush time.Time
 
 	// starts consuming the tuple events
 	for {
@@ -103,91 +111,124 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 		case <-ctx.Done():
 			// flush the remaining tuple
 			if len(tupleBatch) > 0 {
-				// TODO: maybe if the flush fail we could retry the flush by two ways, i.e first-> 
+				flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+				err := c.flushBatch(flushCtx, tupleBatch, pendingMsgs, partitionID)
+				cancel()
+
+				if err != nil {
+					log.Printf("consumer-%d] final flush failed: %v", partitionID, err)
+					return err
+				}
+
+				// TODO: maybe if the flush fail we could retry the flush by two ways, i.e first->
 				// trying to flush it again by the same consumer i.e. pausing the consumer for new tuple
 				// and retring the existing faild tuple again.... and if it still fails by trying a max retry
 				// limit, we could push the tuple to DLQ (which ofc has to be created) OR
 				// second approch -> the we could push the failed tuple to a new rety queue and dont not disturb
 				// the current consumer workflow.... and then the rety queue will try that after some time (i.e delay)
-				// but again i see a race condition i.e. if retry queue and consumer queue try to update the word 
+				// but again i see a race condition i.e. if retry queue and consumer queue try to update the word
 				// "nice" freq concurrently, then one would over write the other and thus creating a problem,
 				// so maybe we could try to flush those retry queue consumed tuple when all the consumers are inactive
-				// i.e only when either they dont have any new tuple to consume or they are shut down i.e ctrl+c, at 
+				// i.e only when either they dont have any new tuple to consume or they are shut down i.e ctrl+c, at
 				// that moment we can try to flush the failed tuple....and if still failed we could move them to DLQ
 				// after certian max retry limit e.g. retry_limit = 3
-
-				log.Printf("[consumer-%d] shutdown: flushing %d words", partitionID, len(tupleBatch))
-				c.flushWithRetry(context.Background(), tupleBatch, partitionID);
-				log.Printf("[consumer-%d] flushed - %d words", partitionID, len(tupleBatch))
 			}
 			log.Printf("[consumer-%d] shutting down", partitionID)
 			return nil
 		default:
-			msgs, err := consumer.Fetch(10, jetstream.FetchMaxWait(2*time.Second))
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				continue
-			}
-
-			for msg := range msgs.Messages() {
-				// process the tuple event and add it into the map & update count
-				if err := c.processTuple(partitionID, msg.Data(), tupleBatch); err != nil {
-					log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
-					msg.Nak()
-					continue
-				}
-				// msg.Ack();
-
-				// flush it into DB
-				if len(tupleBatch) >= batchSize {
-					log.Printf("[consumer-%d] flushing %d words", partitionID, len(tupleBatch))
-					// flush
-					if err := c.flushDB(ctx, tupleBatch); err != nil {
-						log.Printf("[consumer-%d] flush failed: %v", partitionID, err)
+			msgs, err := consumer.Fetch(10, jetstream.FetchMaxWait(time.Second))
+			if err == nil {
+				for msg := range msgs.Messages() {
+					// process the tuple event and add it into the map & update count
+					if err := c.processTuple(partitionID, msg.Data(), tupleBatch); err != nil {
+						log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
 						msg.Nak()
 						continue
-
 					}
-					// reset
-					tupleBatch = make(map[string]int, batchSize)
-				}
 
-				msg.Ack()
+					if pendingCount == 0 {
+						lastFlush = time.Now()
+					}
+					pendingMsgs = append(pendingMsgs, msg)
+					pendingCount++
+				}
+			
+			} else if !errors.Is(err, context.Canceled){
+				 log.Printf("[consumer-%d] fetch error: %v", partitionID, err);
 			}
+
+
+			// flush if size threshold OR time threshold is reached.
+			shouldFlush := pendingCount >= batchSize || (pendingCount > 0 && time.Since(lastFlush) >= flushInterval)
+
+			if shouldFlush{
+				log.Printf("[consumer-%d] flushing %d events, %d unique words",partitionID,pendingCount,len(tupleBatch))
+				if err := c.flushBatch(ctx, tupleBatch, pendingMsgs, partitionID); err != nil{
+					log.Printf("[consumer-%d] flush failed: %v",partitionID, err)
+	
+					// Keep the batch in memory for another attempt. Don't ACK these messages yet.
+					continue
+				}
+	
+				log.Printf("[consumer-%v] info: %v, %d, %v, %v", partitionID, tupleBatch, pendingCount, pendingMsgs, lastFlush)
+	
+				tupleBatch = make(map[string]int, batchSize);
+				pendingMsgs = nil;
+				pendingCount = 0;
+				lastFlush = time.Time{}
+			}
+
 		}
 	}
 }
 
-func (c *Client) flushWithRetry(ctx context.Context,batch map[string]int, partitionID int) {
-	for i :=1 ; i<= flushMaxRetry; i++{
-		if err := c.flushDB(ctx, batch); err != nil{
-			log.Printf("[consumer-%d] flush attempt %d/%d failed: %v", partitionID, i, flushMaxRetry, err);
+// it is still at-least-once, not exactly-once: if PostgreSQL commits and an ACK fails, a redelivered message could increment the count again. Preventing that requires message-level idempotency.
+func (c *Client) flushBatch(ctx context.Context, batch map[string]int, pending []jetstream.Msg, partitionID int) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	if err := c.flushDB(ctx, batch, partitionID); err != nil {
+		return err
+	}
+
+	for _, msg := range pending {
+		if err := msg.Ack(); err != nil {
+			log.Printf("[consumer-%d] ACK failed: %v", partitionID, err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) flushWithRetry(ctx context.Context, batch map[string]int, partitionID int) {
+	for i := 1; i <= flushMaxRetry; i++ {
+		if err := c.flushDB(ctx, batch, partitionID); err != nil {
+			log.Printf("[consumer-%d] flush attempt %d/%d failed: %v", partitionID, i, flushMaxRetry, err)
 
 			if i == flushMaxRetry {
-				// TODO: push the batch into the DLQ OR Re-enqueue to a dedicated 
-				// NATS retry subject with exponential back-off; the retry 
-				// consumer only runs when the main consumers are quiescent 
+				// TODO: push the batch into the DLQ OR Re-enqueue to a dedicated
+				// NATS retry subject with exponential back-off; the retry
+				// consumer only runs when the main consumers are quiescent
 				// to avoid the same race condition.
 				log.Printf("[consumer-%d] giving up after %d attempts — %d words may be lost", partitionID, flushMaxRetry, len(batch))
 			}
-			continue;
+			continue
 		}
 		// If no error...
 		log.Printf("[consumer-%d] shutdown flush succeeded (%d words)", partitionID, len(batch))
-		return;
+		return
 	}
 }
 
-func (c *Client) flushDB(ctx context.Context, batch map[string]int) error {
-	tx, err := c.pg.BeginTx(ctx, nil);
+func (c *Client) flushDB(ctx context.Context, batch map[string]int, partitionID int) error {
+	tx, err := c.pg.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 
-	query := `INSERT INTO word_counts(word, count) VALUES ($1, $2) ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count`;
-	log.Printf("flushing %d records to DB", len(batch))
+	query := `INSERT INTO word_counts(word, count) VALUES ($1, $2) ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -196,7 +237,7 @@ func (c *Client) flushDB(ctx context.Context, batch map[string]int) error {
 	}
 	defer stmt.Close()
 
-	log.Printf("flushing %d words to DB", len(batch))
+	log.Printf("[consumer-%v] flushing %d words to DB\n", partitionID, len(batch))
 	for word, count := range batch {
 		if _, err := stmt.ExecContext(ctx, word, count); err != nil {
 			tx.Rollback()
@@ -207,8 +248,8 @@ func (c *Client) flushDB(ctx context.Context, batch map[string]int) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
-	
-	log.Printf("flushed %d words to DB", len(batch))
+
+	log.Printf("[consumer-%v] flushed %d words to DB\n", partitionID, len(batch))
 	return nil
 }
 

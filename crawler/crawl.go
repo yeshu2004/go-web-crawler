@@ -332,38 +332,10 @@ func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats 
 	id := uuid.NewString()
 	bfKey := "crawler:" + id + ":bloom"
 
-	// rdb, err := db.RedisInit(ctx)
-	// if err != nil {
-	// 	log.Println("Redis connection failed:", err)
-	// 	return nil, err
-	// }
-
 	if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
 		log.Println("Bloom filter init failed:", err)
 		return nil, err
 	}
-
-	// badgerDB connection
-	// badgerPath := "./crwal_db/" + id
-	// badgerDB, err := badger.Open(badger.LSMOnlyOptions(badgerPath))
-	// if err != nil {
-	// 	log.Println("BadgerDB connection failed:", err)
-	// 	return nil, err
-	// }
-
-	// NATS AND PG connection
-	// natsClient, err := nats.NewNATSANDPGConn()
-	// if err != nil {
-	// 	log.Println("Nats && PG connection failed:", err)
-	// 	return nil, err
-	// }
-
-	// NATS create tuple stream
-	// if err := natsClient.CreateTupleStream(ctx); err != nil {
-	// 	log.Println(err)
-	// 	return nil, err
-	// }
-	// log.Println("Nats Tuple Stream connection sucessfull...")
 
 	return &Crawler{
 		Id:     id,

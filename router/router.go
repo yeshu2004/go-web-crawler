@@ -72,10 +72,10 @@ func ConnectInfra() (*RouterSrv, error){
 	}, nil
 }
 
-// every request starts a new independent crawler execution.
-// Infrastructure (Redis, NATS, PostgreSQL, Badger) is shared,
-// while crawler-specific state such as ID, queue and Bloom filter
-// is isolated per crawler.
+// every request starts a new independent crawler execution 
+// infrastructure (Redis, NATS, PostgreSQL, Badger) is shared,
+// while crawler-specific state such as ID, queue and Bloom filter is isolated per crawler.
+// i.e each crawler req have its own bloom filter, id and queue
 func (s *RouterSrv) runWebCrawler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		err := fmt.Sprintf("expected: %v, recived: %v", http.MethodPost, r.Method)

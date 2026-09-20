@@ -36,9 +36,10 @@ var (
 	fp_rate  = 0.001
 )
 
-var claimURLScript = redis.NewScript(`
-    if redis.call("BF.EXISTS", KEYS[1], ARGV[1]) == 0 then
+var enqueueIfNewScript = redis.NewScript(`
+	if redis.call("BF.EXISTS", KEYS[1], ARGV[1]) == 0 then
         redis.call("BF.ADD", KEYS[1], ARGV[1])
+		redis.call("LPUSH", KEYS[2], ARGV[2])
         return 1
     end
 
@@ -131,13 +132,14 @@ func (c *Crawler) worker(ctx context.Context) {
 			links := extractLinks(body, url) // helper function used
 
 			for _, link := range links {
-				claimed, err := c.claimURL(ctx, link)
+
+				enqueued, err := c.enqueuIfNew(ctx, link)
 				if err != nil {
-					log.Printf("failed to claim %s: %v", link, err)
+					log.Printf("failed to enqueue link-%s: %v", link, err)
 					continue
 				}
 
-				if !claimed {
+				if !enqueued {
 					total := c.duplicateCount.Add(1)
 
 					if total <= 100 || total%5000 == 0 {
@@ -147,13 +149,29 @@ func (c *Crawler) worker(ctx context.Context) {
 					continue
 				}
 
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					c.enqueue(ctx, link)
-					// case c.queue <- link: // pushes link in queue
-				}
+				// claimed, err := c.claimURL(ctx, link)
+				// if err != nil {
+				// 	log.Printf("failed to claim %s: %v", link, err)
+				// 	continue
+				// }
+
+				// if !claimed {
+				// 	total := c.duplicateCount.Add(1)
+
+				// 	if total <= 100 || total%5000 == 0 {
+				// 		log.Printf("Duplicate skipped (%d total): %s", total, link)
+				// 	}
+
+				// 	continue
+				// }
+
+				// select {
+				// case <-ctx.Done():
+				// 	return
+				// default:
+				// 	c.enqueue(ctx, link)
+				// 	// case c.queue <- link: // pushes link in queue
+				// }
 			}
 			log.Printf("Extracted %d links from %s", len(links), url)
 		}
@@ -294,22 +312,6 @@ func extractLinks(body []byte, baseURLStr string) []string {
 	return links
 }
 
-func (c *Crawler) claimURL(ctx context.Context, url string) (bool, error) {
-	hash := hashURL(url)
-
-	result, err := claimURLScript.Run(ctx, c.rdb, []string{c.bfKey}, hash).Int()
-
-	if err != nil {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-
-		return false, fmt.Errorf("failed to claim URL: %w", err)
-	}
-
-	return result == 1, nil
-}
-
 func hashURL(u string) string {
 	h := sha256.Sum256([]byte(u))
 	return hex.EncodeToString(h[:])
@@ -344,32 +346,43 @@ func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats 
 	}
 
 	return &Crawler{
-		Id:       id,                       // each crawler will have unique id
-		queueKey: queueID,                  // ... unique independent queue
-		rdb:      rdb,                      // shared
-		badger:   badger,                   // shared
-		nats:     nats,                     // shared
-		bfKey:    bfKey,                    // unqiue
+		Id:       id,      // each crawler will have unique id
+		queueKey: queueID, // ... unique independent queue
+		rdb:      rdb,     // shared
+		badger:   badger,  // shared
+		nats:     nats,    // shared
+		bfKey:    bfKey,   // unqiue
 		// queue:    make(chan string, 10000), // unique (not required now)
 	}, nil
 }
 
 func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 	for _, seed := range urlSeeds {
-		claimed, err := c.claimURL(ctx, seed)
+
+		enqueued, err := c.enqueuIfNew(ctx, seed)
 		if err != nil {
-			log.Printf("failed to claim seed %s: %v", seed, err)
-			return
+			log.Printf("Failed to enqueue %s: %v", seed, err)
+			continue
 		}
 
-		if claimed {
-			// select {
-			// case c.queue <- seed:
-			// case <-ctx.Done():
-				// return
-			// }
-			c.enqueue(ctx, seed)
+		if !enqueued {
+			c.duplicateCount.Add(1)
 		}
+
+		// claimed, err := c.claimURL(ctx, seed)
+		// if err != nil {
+		// 	log.Printf("failed to claim seed %s: %v", seed, err)
+		// 	return
+		// }
+
+		// if claimed {
+		// 	// select {
+		// 	// case c.queue <- seed:
+		// 	// case <-ctx.Done():
+		// 	// return
+		// 	// }
+		// 	c.enqueue(ctx, seed)
+		// }
 	}
 
 	// start workers
@@ -382,11 +395,16 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 	log.Println("Crawl completed successfully!")
 }
 
-func (c *Crawler) enqueue(ctx context.Context, link string) {
-	if err := c.rdb.LPush(ctx, c.queueKey, link).Err(); err != nil {
-		log.Printf("redis enqueue failed: %v\n", err)
-		return
+// enqueuIfNew first checks through the bloom filter, if the link is not visited then
+// it is enqueued in the queue, other vise not. This is done in "procedural" way i.e.
+// those two operations happen atomically from Redis's point of view.
+func (c *Crawler) enqueuIfNew(ctx context.Context, link string) (bool, error) {
+	urlHash := hashURL(link)
+	if err := enqueueIfNewScript.Run(ctx, c.rdb, []string{c.bfKey, c.queueKey}, urlHash, link).Err(); err != nil {
+		return false, err
 	}
+
+	return true, nil
 }
 
 func (c *Crawler) dequeue(ctx context.Context) (string, error) {
@@ -398,34 +416,71 @@ func (c *Crawler) dequeue(ctx context.Context) (string, error) {
 	return url, nil
 }
 
-// // NOT REQUIRED AS CLIENT WILL SEND THE URL_SEEDS
-// func initialUrlSeed() []string {
-// 	return []string{
-// 		"https://en.wikipedia.org/wiki/Hindus",
-// 		// "https://www.indiatoday.in/",
-// 		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
-// 		// "http://quotes.toscrape.com",
-// 	}
-// }
+// 	OLD/NOT REQUIRED CODE:
+
+// NOT IN USE NOW AS UPDATED CODE DOES THAT IN ONE ATOMIC OPERATION
+func (c *Crawler) claimURL(ctx context.Context, url string) (bool, error) {
+	hash := hashURL(url)
+
+	result, err := claimURLScript.Run(ctx, c.rdb, []string{c.bfKey}, hash).Int()
+
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+
+		return false, fmt.Errorf("failed to claim URL: %w", err)
+	}
+
+	return result == 1, nil
+}
+
+// REPLACED WITH ENQUEUEIFEXISTS
+func (c *Crawler) enqueue(ctx context.Context, link string) {
+	if err := c.rdb.LPush(ctx, c.queueKey, link).Err(); err != nil {
+		log.Printf("redis enqueue failed: %v\n", err)
+		return
+	}
+}
+
+// WROTE NEW LUA SCRIPT FOR ATOMIC OPERATION
+var claimURLScript = redis.NewScript(`
+    if redis.call("BF.EXISTS", KEYS[1], ARGV[1]) == 0 then
+        redis.call("BF.ADD", KEYS[1], ARGV[1])
+        return 1
+    end
+
+    return 0
+`)
+
+// NOT REQUIRED AS CLIENT WILL SEND THE URL_SEEDS
+func initialUrlSeed() []string {
+	return []string{
+		"https://en.wikipedia.org/wiki/Hindus",
+		// "https://www.indiatoday.in/",
+		// "http://finetranscendentsublimeeclipse.neverssl.com/online/", // best for word testing
+		// "http://quotes.toscrape.com",
+	}
+}
 
 // REPLACED WITH REDIS LUA SCIRPT: Check's if Bloom Filter has the url(Redis).
-// func (c *Crawler) seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
-// 	hash := hashURL(url)
-// 	exists, err := rdb.BFExists(ctx, c.bfKey, hash).Result()
-// 	if err != nil {
-// 		if ctx.Err() == context.Canceled {
-// 			return true
-// 		}
-// 		log.Printf("BFExists error: %v", err)
-// 		return true
-// 	}
-// 	return exists
-// }
+func (c *Crawler) seenBefore(ctx context.Context, rdb *redis.Client, url string) bool {
+	hash := hashURL(url)
+	exists, err := rdb.BFExists(ctx, c.bfKey, hash).Result()
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			return true
+		}
+		log.Printf("BFExists error: %v", err)
+		return true
+	}
+	return exists
+}
 
 // REPLACED WITH REDIS LUA SCIRPT: marks the url in Bloom Filter(Redis).
-// func (c *Crawler) markSeen(ctx context.Context, rdb *redis.Client, url string) {
-// 	hash := hashURL(url)
-// 	if err := rdb.BFAdd(ctx, c.bfKey, hash).Err(); err != nil {
-// 		log.Printf("BFAdd failed for %s: %v", url, err)
-// 	}
-// }
+func (c *Crawler) markSeen(ctx context.Context, rdb *redis.Client, url string) {
+	hash := hashURL(url)
+	if err := rdb.BFAdd(ctx, c.bfKey, hash).Err(); err != nil {
+		log.Printf("BFAdd failed for %s: %v", url, err)
+	}
+}

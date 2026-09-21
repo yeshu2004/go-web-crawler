@@ -147,7 +147,7 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 			if err == nil {
 				for msg := range msgs.Messages() {
 					// process the tuple event and add it into the map & update count
-					event, err := c.processTuple(partitionID, msg.Data()); 
+					events, err := c.processTuple(partitionID, msg.Data()); 
 					if err != nil {
 						log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
 						msg.Nak()
@@ -157,7 +157,11 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 					if pendingCount == 0 {
 						lastFlush = time.Now()
 					}
-					pendingEvents = append(pendingEvents, event);
+
+					for _, event := range events {
+						pendingEvents = append(pendingEvents, event)
+					}
+					// pendingEvents = append(pendingEvents, event);
 					pendingMsgs = append(pendingMsgs, msg)
 					pendingCount++
 				}
@@ -279,17 +283,17 @@ func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partiti
 	return nil
 }
 
-func (c *Client) processTuple(partitionID int, b []byte) (types.TupleEvent, error) {
-	var t types.TupleEvent
-	if err := json.Unmarshal(b, &t); err != nil {
-		return t, fmt.Errorf("unmarshal: %w", err)
+func (c *Client) processTuple(partitionID int, b []byte) ([]types.TupleEvent, error) {
+	var events []types.TupleEvent
+	if err := json.Unmarshal(b, &events); err != nil {
+		return events, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	log.Printf("[consumer-%d] word=%s freq=%d url=%s", partitionID, t.Word, t.Count, t.URLHash)
+	// log.Printf("[consumer-%d] word=%s freq=%d url=%s", partitionID, t.Word, t.Count, t.URLHash)
 
 	// Q! why are we actually having urlHash in msg event ? do we need it ?
 	// tupleBatch[t.Word] += t.Count // default value is 0
-	return t, nil
+	return events, nil
 }
 
 func partitionSubject(id int) string {

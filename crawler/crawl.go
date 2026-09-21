@@ -148,53 +148,47 @@ func (c *Crawler) worker(ctx context.Context) {
 
 					continue
 				}
-
-				// claimed, err := c.claimURL(ctx, link)
-				// if err != nil {
-				// 	log.Printf("failed to claim %s: %v", link, err)
-				// 	continue
-				// }
-
-				// if !claimed {
-				// 	total := c.duplicateCount.Add(1)
-
-				// 	if total <= 100 || total%5000 == 0 {
-				// 		log.Printf("Duplicate skipped (%d total): %s", total, link)
-				// 	}
-
-				// 	continue
-				// }
-
-				// select {
-				// case <-ctx.Done():
-				// 	return
-				// default:
-				// 	c.enqueue(ctx, link)
-				// 	// case c.queue <- link: // pushes link in queue
-				// }
 			}
 			log.Printf("Extracted %d links from %s", len(links), url)
 		}
 	}
 }
 
+
 func (c *Crawler) publishTuple(ctx context.Context, freqMap map[string]int, URLHash string) error {
-	for word, count := range freqMap {
-		partitionID := partitionFor(word, indexerWorkers)
+	buckets := make(map[int][]tp.TupleEvent, indexerWorkers);
 
-		id := uuid.New().String()
-		tuple := newTupleEvent(id, word, count, URLHash)
-		b, err := json.Marshal(tuple)
-		if err != nil {
-			return fmt.Errorf("error in tuple conversion: %v", err)
-		}
-
-		if err := c.nats.PublishTupleEvent(ctx, partitionID, b); err != nil {
-			return fmt.Errorf("url(%s) tuple publish error: %v", URLHash, err)
-		}
-
-		log.Printf("Word (%s), Freq (%d) publish to partitionID:%d \n", tuple.Word, tuple.Count, partitionID)
+	for word, count := range freqMap{
+		pid := partitionFor(word, indexerWorkers)
+		tuple := newTupleEvent(uuid.NewString(), word, count, URLHash)
+		buckets[pid] = append(buckets[pid], *tuple)
 	}
+
+	for pid, events := range buckets{
+		b, err := json.Marshal(events)
+        if err != nil {
+            return fmt.Errorf("marshal batch pid=%d: %w", pid, err)
+        }
+        if err := c.nats.PublishTupleEvent(ctx, pid, b); err != nil {
+            return fmt.Errorf("publish batch pid=%d: %w", pid, err)
+        }
+	}
+	// for word, count := range freqMap {
+	// 	partitionID := partitionFor(word, indexerWorkers)
+
+	// 	id := uuid.New().String()
+	// 	tuple := newTupleEvent(id, word, count, URLHash)
+	// 	b, err := json.Marshal(tuple)
+	// 	if err != nil {
+	// 		return fmt.Errorf("error in tuple conversion: %v", err)
+	// 	}
+
+	// 	if err := c.nats.PublishTupleEvent(ctx, partitionID, b); err != nil {
+	// 		return fmt.Errorf("url(%s) tuple publish error: %v", URLHash, err)
+	// 	}
+
+	// 	log.Printf("Word (%s), Freq (%d) publish to partitionID:%d \n", tuple.Word, tuple.Count, partitionID)
+	// }
 	return nil
 }
 
@@ -368,21 +362,6 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 		if !enqueued {
 			c.duplicateCount.Add(1)
 		}
-
-		// claimed, err := c.claimURL(ctx, seed)
-		// if err != nil {
-		// 	log.Printf("failed to claim seed %s: %v", seed, err)
-		// 	return
-		// }
-
-		// if claimed {
-		// 	// select {
-		// 	// case c.queue <- seed:
-		// 	// case <-ctx.Done():
-		// 	// return
-		// 	// }
-		// 	c.enqueue(ctx, seed)
-		// }
 	}
 
 	// start workers
@@ -400,11 +379,12 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 // those two operations happen atomically from Redis's point of view.
 func (c *Crawler) enqueuIfNew(ctx context.Context, link string) (bool, error) {
 	urlHash := hashURL(link)
-	if err := enqueueIfNewScript.Run(ctx, c.rdb, []string{c.bfKey, c.queueKey}, urlHash, link).Err(); err != nil {
+	n, err := enqueueIfNewScript.Run(ctx, c.rdb, []string{c.bfKey, c.queueKey}, urlHash, link).Int();
+	if err != nil {
 		return false, err
 	}
 
-	return true, nil
+	return n == 1, nil
 }
 
 func (c *Crawler) dequeue(ctx context.Context) (string, error) {

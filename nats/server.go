@@ -236,12 +236,6 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 					} else {
 						return dlqErr
 					}
-					// select {
-					// case <-time.After(2 * time.Second):
-					// case <-ctx.Done():
-					// }
-					// continue // retry same batch
-
 				}
 
 				// log.Printf("[consumer-%v] info: %v, %d, %v, %v", partitionID, pendingEvents, pendingCount, pendingMsgs, lastFlush)

@@ -17,8 +17,8 @@ import (
 
 var crawlerManager = NewCrawlerManager()
 
-type RouterSrv struct{
-	rdb *redis.Client
+type RouterSrv struct {
+	rdb    *redis.Client
 	badger *badger.DB
 	nats   *nats.Client
 }
@@ -32,7 +32,7 @@ func (s *RouterSrv) Router() http.Handler {
 	return mux
 }
 
-func ConnectInfra() (*RouterSrv, error){
+func ConnectInfra() (*RouterSrv, error) {
 	ctx := context.Background()
 	rdb, err := db.RedisInit(ctx)
 	if err != nil {
@@ -43,7 +43,7 @@ func ConnectInfra() (*RouterSrv, error){
 	badgerPath := "./crwal_db/"
 	badgerDB, err := badger.Open(badger.LSMOnlyOptions(badgerPath))
 	if err != nil {
-		rdb.Close();
+		rdb.Close()
 		log.Println("BadgerDB connection failed:", err)
 		return nil, err
 	}
@@ -52,27 +52,35 @@ func ConnectInfra() (*RouterSrv, error){
 	natsClient, err := nats.NewNATSANDPGConn()
 	if err != nil {
 		rdb.Close()
-        badgerDB.Close()
+		badgerDB.Close()
 		log.Println("Nats && PG connection failed:", err)
 		return nil, err
 	}
 
 	if err := natsClient.CreateTupleStream(ctx); err != nil {
 		rdb.Close()
-        badgerDB.Close()
+		badgerDB.Close()
 		log.Println(err)
 		return nil, err
 	}
 	log.Println("Nats Tuple Stream connection sucessfull...")
 
+	if err := natsClient.CreateDLQStream(ctx); err != nil {
+		rdb.Close()
+		badgerDB.Close()
+		log.Println(err)
+		return nil, err
+	}
+	log.Println("Nats DLQ Stream connection sucessfull...")
+
 	return &RouterSrv{
-		rdb: rdb,
+		rdb:    rdb,
 		badger: badgerDB,
-		nats: natsClient,
+		nats:   natsClient,
 	}, nil
 }
 
-// every request starts a new independent crawler execution 
+// every request starts a new independent crawler execution
 // infrastructure (Redis, NATS, PostgreSQL, Badger) is shared,
 // while crawler-specific state such as ID, queue and Bloom filter is isolated per crawler.
 // i.e each crawler req have its own bloom filter, id and queue
@@ -87,7 +95,7 @@ func (s *RouterSrv) runWebCrawler(w http.ResponseWriter, r *http.Request) {
 		InitalUrlSeeds []string `json:"seed_url"`
 	}
 	var reqBody req
-	
+
 	// the url of the main seed will come through the body
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -97,7 +105,7 @@ func (s *RouterSrv) runWebCrawler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	crawler, err := c.NewCrawler(ctx, s.rdb, s.badger, s.nats)
 	if err != nil {
-		cancel();
+		cancel()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

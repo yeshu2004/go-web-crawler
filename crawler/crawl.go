@@ -34,6 +34,8 @@ var (
 	client   = &http.Client{Timeout: 30 * time.Second}
 	expected = 10000000
 	fp_rate  = 0.001
+	maxRetry = 3
+
 )
 
 var enqueueIfNewScript = redis.NewScript(`
@@ -110,7 +112,7 @@ func (c *Crawler) worker(ctx context.Context) {
 			}
 
 			freqMap := buildFreqMap(text)                             // builds a word coud freq map
-			if err := c.publishTuple(ctx, freqMap, key); err != nil { // IDEA 3
+			if err := c.publishTupleWithRetry(ctx, freqMap, key); err != nil { // IDEA 3
 				log.Println(err)
 			}
 
@@ -154,41 +156,60 @@ func (c *Crawler) worker(ctx context.Context) {
 	}
 }
 
+func (c *Crawler) publishTupleWithRetry(ctx context.Context, freqMap map[string]int, urlHash string) error {
+	buckets := make(map[int][]tp.TupleEvent, indexerWorkers)
+
+	for word, count := range freqMap {
+		pid := partitionFor(word, indexerWorkers)
+		tuple := newTupleEvent(uuid.NewString(), word, count, urlHash)
+		buckets[pid] = append(buckets[pid], *tuple)
+	}
+
+	for pid, events := range buckets {
+		b, err := json.Marshal(events)
+		if err != nil {
+			return fmt.Errorf("marshal batch pid=%d: %w", pid, err)
+		}
+
+		var lastErr error
+		for i := 1; i <= maxRetry; i++ {
+			if err := c.nats.PublishTupleEvent(ctx, pid, b); err != nil {
+				lastErr = err
+				backoff := time.Duration(1<<i) * 100 * time.Millisecond
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+			return nil
+		}
+
+		return fmt.Errorf("[pid-%d] publish failed after %d retries: %w", pid, maxRetry, lastErr)
+	}
+
+	return nil
+}
 
 func (c *Crawler) publishTuple(ctx context.Context, freqMap map[string]int, URLHash string) error {
-	buckets := make(map[int][]tp.TupleEvent, indexerWorkers);
+	buckets := make(map[int][]tp.TupleEvent, indexerWorkers)
 
-	for word, count := range freqMap{
+	for word, count := range freqMap {
 		pid := partitionFor(word, indexerWorkers)
 		tuple := newTupleEvent(uuid.NewString(), word, count, URLHash)
 		buckets[pid] = append(buckets[pid], *tuple)
 	}
 
-	for pid, events := range buckets{
+	for pid, events := range buckets {
 		b, err := json.Marshal(events)
-        if err != nil {
-            return fmt.Errorf("marshal batch pid=%d: %w", pid, err)
-        }
-        if err := c.nats.PublishTupleEvent(ctx, pid, b); err != nil {
-            return fmt.Errorf("publish batch pid=%d: %w", pid, err)
-        }
+		if err != nil {
+			return fmt.Errorf("marshal batch pid=%d: %w", pid, err)
+		}
+		if err := c.nats.PublishTupleEvent(ctx, pid, b); err != nil {
+			return fmt.Errorf("publish batch pid=%d: %w", pid, err)
+		}
 	}
-	// for word, count := range freqMap {
-	// 	partitionID := partitionFor(word, indexerWorkers)
-
-	// 	id := uuid.New().String()
-	// 	tuple := newTupleEvent(id, word, count, URLHash)
-	// 	b, err := json.Marshal(tuple)
-	// 	if err != nil {
-	// 		return fmt.Errorf("error in tuple conversion: %v", err)
-	// 	}
-
-	// 	if err := c.nats.PublishTupleEvent(ctx, partitionID, b); err != nil {
-	// 		return fmt.Errorf("url(%s) tuple publish error: %v", URLHash, err)
-	// 	}
-
-	// 	log.Printf("Word (%s), Freq (%d) publish to partitionID:%d \n", tuple.Word, tuple.Count, partitionID)
-	// }
 	return nil
 }
 
@@ -379,7 +400,7 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 // those two operations happen atomically from Redis's point of view.
 func (c *Crawler) enqueuIfNew(ctx context.Context, link string) (bool, error) {
 	urlHash := hashURL(link)
-	n, err := enqueueIfNewScript.Run(ctx, c.rdb, []string{c.bfKey, c.queueKey}, urlHash, link).Int();
+	n, err := enqueueIfNewScript.Run(ctx, c.rdb, []string{c.bfKey, c.queueKey}, urlHash, link).Int()
 	if err != nil {
 		return false, err
 	}

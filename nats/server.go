@@ -19,10 +19,12 @@ import (
 const (
 	streamName     = "TUPLE"
 	streamSubjects = "TUPLE.*"
-	NumPartitions  = 4
 	batchSize      = 1000
+	maxBatchEvents = 5000
 	flushMaxRetry  = 3
 	flushInterval  = 5 * time.Second
+	maxDLQRetry    = 3
+	NumPartitions  = 4
 )
 
 type Client struct {
@@ -48,6 +50,51 @@ func NewNATSANDPGConn() (*Client, error) {
 	log.Printf("PGSQL connected....")
 
 	return &Client{js: js, pg: pg}, nil
+}
+
+func (c *Client) CreateDLQStream(ctx context.Context) error {
+	if _, err := c.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:        "DLQ",
+		Description: "DLQ for failed tupleEvents",
+		Subjects:    []string{"DLQ.>"},
+		Storage:     jetstream.FileStorage,
+		Retention:   jetstream.LimitsPolicy,
+		Discard:     jetstream.DiscardOld,
+		MaxMsgs:     -1,
+		MaxBytes:    -1,
+		Replicas:    1,
+	}); err != nil {
+		return fmt.Errorf("create DLQ stream: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) PublishTupleEventsDLQ(ctx context.Context, payload []byte) error {
+	var lastErr error
+	for i := 1; i <= maxDLQRetry; i++ {
+		_, err := c.js.Publish(ctx, "DLQ.tuple-event", payload)
+		if err != nil {
+			lastErr = err
+			log.Printf("DLQ publish tupleEvent error: %v\n", err)
+			if i == maxDLQRetry {
+				break
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(i) * time.Second):
+			}
+
+			continue
+		}
+
+		return nil
+	}
+
+	log.Printf("CRITICAL: failed to publish event to DLQ after %d retries: %v", maxDLQRetry, lastErr)
+	return fmt.Errorf("DLQ publish: %w", lastErr)
 }
 
 func (c *Client) CreateTupleStream(ctx context.Context) error {
@@ -95,17 +142,14 @@ func (c *Client) StartConsumer(ctx context.Context, partitionID int) error {
 	}
 	log.Printf("[consumer-%d] ready on subject %s", partitionID, partitionSubject(partitionID))
 
-	return c.consume(ctx, consumer, partitionID);
+	return c.consume(ctx, consumer, partitionID)
 }
 
-
 // main design is at-least-once NATS delivery with idempotent PostgreSQL processing,
-// not literal exactly-once message delivery, but this gives once message delivery kinda... 
-// because the event ID insert and word-count increment happen in the same transaction, a 
+// not literal exactly-once message delivery, but this gives once message delivery kinda...
+// because the event ID insert and word-count increment happen in the same transaction, a
 // redelivery after a successful DB commit won't increment the word again.
 func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, partitionID int) error {
-	// initilize the batch and count size
-	// tupleBatch := make(map[string]int, batchSize) // pre allocate the map of batchsize
 	var pendingMsgs []jetstream.Msg
 	var pendingEvents []types.TupleEvent
 	pendingCount := 0
@@ -119,26 +163,27 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 			if len(pendingEvents) > 0 {
 				flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-				err := c.flushBatch(flushCtx, pendingEvents, pendingMsgs, partitionID)
+				err := c.flushBatchWithRetry(flushCtx, pendingEvents, pendingMsgs, partitionID)
 				cancel()
 
+				// DLQ
 				if err != nil {
-					log.Printf("consumer-%d] final flush failed: %v", partitionID, err)
-					return err
-				}
+					log.Printf("consumer-%d] final flush failed i.e trying DLQ: %v", partitionID, err)
 
-				// TODO: maybe if the flush fail we could retry the flush by two ways, i.e first->
-				// trying to flush it again by the same consumer i.e. pausing the consumer for new tuple
-				// and retring the existing faild tuple again.... and if it still fails by trying a max retry
-				// limit, we could push the tuple to DLQ (which ofc has to be created) OR
-				// second approch -> the we could push the failed tuple to a new rety queue and dont not disturb
-				// the current consumer workflow.... and then the rety queue will try that after some time (i.e delay)
-				// but again i see a race condition i.e. if retry queue and consumer queue try to update the word
-				// "nice" freq concurrently, then one would over write the other and thus creating a problem,
-				// so maybe we could try to flush those retry queue consumed tuple when all the consumers are inactive
-				// i.e only when either they dont have any new tuple to consume or they are shut down i.e ctrl+c, at
-				// that moment we can try to flush the failed tuple....and if still failed we could move them to DLQ
-				// after certian max retry limit e.g. retry_limit = 3
+					dlqErr := c.pushToDLQ(pendingEvents, partitionID)
+					if dlqErr == nil {
+						// ACK
+						for _, msg := range pendingMsgs {
+							if ackErr := msg.Ack(); ackErr != nil {
+								log.Printf("[consumer-%d] ACK after DLQ failed: %v", partitionID, ackErr)
+							}
+						}
+						log.Printf("[consumer-%d] ACK %d events in DLQ", partitionID, len(pendingEvents))
+					} else {
+						return dlqErr
+					}
+
+				}
 			}
 			log.Printf("[consumer-%d] shutting down", partitionID)
 			return nil
@@ -147,7 +192,7 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 			if err == nil {
 				for msg := range msgs.Messages() {
 					// process the tuple event and add it into the map & update count
-					events, err := c.processTuple(partitionID, msg.Data()); 
+					events, err := c.processTuple(partitionID, msg.Data())
 					if err != nil {
 						log.Printf("[consumer-%d] processing error: %v — nacking", partitionID, err)
 						msg.Nak()
@@ -161,30 +206,46 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 					for _, event := range events {
 						pendingEvents = append(pendingEvents, event)
 					}
-					// pendingEvents = append(pendingEvents, event);
 					pendingMsgs = append(pendingMsgs, msg)
 					pendingCount++
 				}
-			
-			} else if !errors.Is(err, context.Canceled){
-				 log.Printf("[consumer-%d] fetch error: %v", partitionID, err);
+
+			} else if !errors.Is(err, context.Canceled) {
+				log.Printf("[consumer-%d] fetch error: %v", partitionID, err)
 			}
 
-
 			// flush if size threshold OR time threshold is reached.
-			shouldFlush := pendingCount >= batchSize || (pendingCount > 0 && time.Since(lastFlush) >= flushInterval)
+			shouldFlush := pendingCount >= batchSize || len(pendingEvents) >= maxBatchEvents || (pendingCount > 0 && time.Since(lastFlush) >= flushInterval)
 
-			if shouldFlush{
-				log.Printf("[consumer-%d] flushing %d events, %d unique words",partitionID,pendingCount,len(pendingEvents))
-				if err := c.flushBatch(ctx, pendingEvents, pendingMsgs, partitionID); err != nil{
-					log.Printf("[consumer-%d] flush failed: %v",partitionID, err)
-	
-					// keep the batch in memory for another attempt, don't ACK these messages yet.
-					continue
+			if shouldFlush {
+				log.Printf("[consumer-%d] flushing %d events, %d unique words", partitionID, pendingCount, len(pendingEvents))
+				err := c.flushBatchWithRetry(ctx, pendingEvents, pendingMsgs, partitionID)
+				if err != nil {
+					log.Printf("[consumer-%d] flush failed: %v", partitionID, err)
+
+					// TODO: DLQ
+					dlqErr := c.pushToDLQ(pendingEvents, partitionID)
+					if dlqErr == nil {
+						// ACK
+						for _, msg := range pendingMsgs {
+							if ackErr := msg.Ack(); ackErr != nil {
+								log.Printf("[consumer-%d] ACK after DLQ failed: %v", partitionID, ackErr)
+							}
+						}
+						log.Printf("[consumer-%d] ACK %d events in DLQ", partitionID, len(pendingEvents))
+					} else {
+						return dlqErr
+					}
+					// select {
+					// case <-time.After(2 * time.Second):
+					// case <-ctx.Done():
+					// }
+					// continue // retry same batch
+
 				}
-	
-				log.Printf("[consumer-%v] info: %v, %d, %v, %v", partitionID, pendingEvents, pendingCount, pendingMsgs, lastFlush)
-	
+
+				// log.Printf("[consumer-%v] info: %v, %d, %v, %v", partitionID, pendingEvents, pendingCount, pendingMsgs, lastFlush)
+
 				// tupleBatch = make(map[string]int, batchSize);
 				pendingEvents = nil
 				pendingMsgs = nil
@@ -196,54 +257,65 @@ func (c *Client) consume(ctx context.Context, consumer jetstream.Consumer, parti
 	}
 }
 
+func (c *Client) pushToDLQ(pendingEvents []types.TupleEvent, partitionID int) error {
+	payload, err := json.Marshal(pendingEvents)
+	if err != nil {
+		return fmt.Errorf("[consumer-%d] CRITICAL: could not marshal DLQ payload: %v", partitionID, err)
+	}
 
-func (c *Client) flushBatch(ctx context.Context, events []types.TupleEvent, pending []jetstream.Msg, partitionID int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if dlqErr := c.PublishTupleEventsDLQ(ctx, payload); dlqErr != nil {
+		return fmt.Errorf("[consumer-%d] CRITICAL: DLQ publish failed, %d events lost: %v", partitionID, len(pendingEvents), dlqErr)
+	}
+
+	log.Printf("[consumer-%d] pushed %d events in DLQ", partitionID, len(pendingEvents))
+	return nil
+}
+
+func (c *Client) flushBatchWithRetry(ctx context.Context, events []types.TupleEvent, pending []jetstream.Msg, partitionID int) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	if err := c.flushDB(ctx, events, partitionID); err != nil {
-		return err
-	}
+	var lastErr error
+	for i := 1; i <= flushMaxRetry; i++ {
+		if err := c.flushDB(ctx, events, partitionID); err != nil {
+			lastErr = err
+			log.Printf("[consumer-%d] flush attempt %d/%d failed: %v", partitionID, i, flushMaxRetry, err)
+			if i == flushMaxRetry {
+				break
+			}
 
-	for _, msg := range pending {
-		if err := msg.Ack(); err != nil {
-			log.Printf("[consumer-%d] ACK failed: %v", partitionID, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(i) * time.Second):
+			}
+
+			continue
 		}
-	}
 
-	return nil
+		for _, msg := range pending {
+			if err := msg.Ack(); err != nil {
+				log.Printf("[consumer-%d] ACK failed: %v", partitionID, err)
+			}
+		}
+
+		return nil
+	}
+	return fmt.Errorf("flush failed after %d attempts: %w", flushMaxRetry, lastErr)
 }
 
-// func (c *Client) flushWithRetry(ctx context.Context, batch map[string]int, partitionID int) {
-// 	for i := 1; i <= flushMaxRetry; i++ {
-// 		if err := c.flushDB(ctx, batch, partitionID); err != nil {
-// 			log.Printf("[consumer-%d] flush attempt %d/%d failed: %v", partitionID, i, flushMaxRetry, err)
-// 			if i == flushMaxRetry {
-// 				// TODO: push the batch into the DLQ OR Re-enqueue to a dedicated
-// 				// NATS retry subject with exponential back-off; the retry
-// 				// consumer only runs when the main consumers are quiescent
-// 				// to avoid the same race condition.
-// 				log.Printf("[consumer-%d] giving up after %d attempts — %d words may be lost", partitionID, flushMaxRetry, len(batch))
-// 			}
-// 			continue
-// 		}
-// 		// If no error...
-// 		log.Printf("[consumer-%d] shutdown flush succeeded (%d words)", partitionID, len(batch))
-// 		return
-// 	}
-// }
-
-
-
-// this is at-least-once delivery with effectively-once database effects, 
+// this is at-least-once delivery with effectively-once database effects,
 // assuming each published event has a stable, unique ID
 func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partitionID int) error {
 	tx, err := c.pg.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback();
+	defer tx.Rollback()
 
 	query := `INSERT INTO word_counts(word, count) VALUES ($1, $2) ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count`
 
@@ -260,14 +332,14 @@ func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partiti
 		ON CONFLICT (event_id) DO NOTHING RETURNING event_id`
 		err := tx.QueryRowContext(ctx, query, event.Id).Scan(&event.Id)
 
-        if err != nil {
-            // if no row was returned, event was already processed.
-            if errors.Is(err, sql.ErrNoRows) {
-                continue
-            }
+		if err != nil {
+			// if no row was returned, event was already processed.
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
 
-            return fmt.Errorf("insert event %s: %w", event.Id, err)
-        }
+			return fmt.Errorf("insert event %s: %w", event.Id, err)
+		}
 
 		if _, err := stmt.ExecContext(ctx, event.Word, event.Count); err != nil {
 			tx.Rollback()
@@ -289,7 +361,7 @@ func (c *Client) processTuple(partitionID int, b []byte) ([]types.TupleEvent, er
 		return events, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	// log.Printf("[consumer-%d] word=%s freq=%d url=%s", partitionID, t.Word, t.Count, t.URLHash)
+	log.Printf("[consumer-%d] tupleEvent processed", partitionID)
 
 	// Q! why are we actually having urlHash in msg event ? do we need it ?
 	// tupleBatch[t.Word] += t.Count // default value is 0

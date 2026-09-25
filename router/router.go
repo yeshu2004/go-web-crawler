@@ -15,6 +15,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const (
+	fp_rate  = 0.001
+	bfKey    = "crawler:" + ":bf"
+	expected = 10000000
+)
+
 var crawlerManager = NewCrawlerManager()
 
 type RouterSrv struct {
@@ -37,6 +43,11 @@ func ConnectInfra() (*RouterSrv, error) {
 	rdb, err := db.RedisInit(ctx)
 	if err != nil {
 		log.Println("Redis connection failed:", err)
+		return nil, err
+	}
+
+	if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
+		log.Println("Bloom filter init failed:", err)
 		return nil, err
 	}
 
@@ -82,8 +93,8 @@ func ConnectInfra() (*RouterSrv, error) {
 
 // every request starts a new independent crawler execution
 // infrastructure (Redis, NATS, PostgreSQL, Badger) is shared,
-// while crawler-specific state such as ID, queue and Bloom filter is isolated per crawler.
-// i.e each crawler req have its own bloom filter, id and queue
+// Each crawler has its own ID and queue.
+// The Bloom filter is global across all crawler runs.
 func (s *RouterSrv) runWebCrawler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		err := fmt.Sprintf("expected: %v, recived: %v", http.MethodPost, r.Method)

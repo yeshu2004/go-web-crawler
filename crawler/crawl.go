@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +20,6 @@ import (
 	"unicode"
 
 	"github/yeshu2004/go-epics/compress"
-	"github/yeshu2004/go-epics/db"
 
 	"github/yeshu2004/go-epics/nats"
 	tp "github/yeshu2004/go-epics/types"
@@ -31,11 +31,12 @@ import (
 )
 
 var (
-	client   = &http.Client{Timeout: 30 * time.Second}
-	expected = 10000000
 	fp_rate  = 0.001
 	maxRetry = 3
-
+	bfKey    = "crawler:" + ":bf"
+	client = &http.Client{
+		Timeout: 30 * time.Second,
+	}
 )
 
 var enqueueIfNewScript = redis.NewScript(`
@@ -111,7 +112,7 @@ func (c *Crawler) worker(ctx context.Context) {
 
 			}
 
-			freqMap := buildFreqMap(text)                             // builds a word coud freq map
+			freqMap := buildFreqMap(text)                                      // builds a word coud freq map
 			if err := c.publishTupleWithRetry(ctx, freqMap, key); err != nil { // IDEA 3
 				log.Println(err)
 			}
@@ -137,6 +138,11 @@ func (c *Crawler) worker(ctx context.Context) {
 
 				enqueued, err := c.enqueuIfNew(ctx, link)
 				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						log.Printf("crawler stopped, skipping remaining links")
+						break
+					}
+
 					log.Printf("failed to enqueue link-%s: %v", link, err)
 					continue
 				}
@@ -160,7 +166,7 @@ func (c *Crawler) publishTupleWithRetry(ctx context.Context, freqMap map[string]
 	buckets := make(map[int][]tp.TupleEvent, indexerWorkers)
 
 	for word, count := range freqMap {
-		pid := partitionFor(word, indexerWorkers)
+		pid := partitionFor(word, indexerWorkers) // pid ranges betweem 1-4
 		tuple := newTupleEvent(uuid.NewString(), word, count, urlHash)
 		buckets[pid] = append(buckets[pid], *tuple)
 	}
@@ -172,6 +178,7 @@ func (c *Crawler) publishTupleWithRetry(ctx context.Context, freqMap map[string]
 		}
 
 		var lastErr error
+		published := false
 		for i := 1; i <= maxRetry; i++ {
 			if err := c.nats.PublishTupleEvent(ctx, pid, b); err != nil {
 				lastErr = err
@@ -183,10 +190,15 @@ func (c *Crawler) publishTupleWithRetry(ctx context.Context, freqMap map[string]
 				}
 				continue
 			}
-			return nil
+
+			published = true
+			break
 		}
 
-		return fmt.Errorf("[pid-%d] publish failed after %d retries: %w", pid, maxRetry, lastErr)
+		if !published {
+			return fmt.Errorf("[pid-%d] publish failed after %d retries: %v", pid, maxRetry, lastErr)
+		}
+
 	}
 
 	return nil
@@ -352,13 +364,7 @@ func resolveURL(href string, base *url.URL) string {
 
 func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats *nats.Client) (*Crawler, error) {
 	id := uuid.NewString()
-	bfKey := "crawler:" + id + ":bloom"
 	queueID := fmt.Sprintf("queue:%s", id)
-
-	if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
-		log.Println("Bloom filter init failed:", err)
-		return nil, err
-	}
 
 	return &Crawler{
 		Id:       id,      // each crawler will have unique id
@@ -366,7 +372,7 @@ func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats 
 		rdb:      rdb,     // shared
 		badger:   badger,  // shared
 		nats:     nats,    // shared
-		bfKey:    bfKey,   // unqiue
+		bfKey:    bfKey,   // shared
 		// queue:    make(chan string, 10000), // unique (not required now)
 	}, nil
 }
@@ -376,6 +382,11 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 
 		enqueued, err := c.enqueuIfNew(ctx, seed)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Printf("crawler stopped, skipping remaining links")
+				break
+			}
+
 			log.Printf("Failed to enqueue %s: %v", seed, err)
 			continue
 		}
@@ -392,6 +403,11 @@ func (c *Crawler) Run(ctx context.Context, urlSeeds []string) {
 	}
 
 	c.wg.Wait()
+	if ctx.Err() != nil {
+		log.Println("Crawl stopped")
+		return
+	}
+
 	log.Println("Crawl completed successfully!")
 }
 

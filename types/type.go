@@ -5,8 +5,9 @@ import (
 )
 
 type TupleEvent struct {
-	Id      string
-	Word    string
-	Count   int
-	URLHash string
+	CrawlerID string
+	EventID   string
+	Word      string
+	Count     int
+	URLHash   string
 }

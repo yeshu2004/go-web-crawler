@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	"github/yeshu2004/go-epics/compress"
+	"github/yeshu2004/go-epics/db"
 
 	"github/yeshu2004/go-epics/nats"
 	tp "github/yeshu2004/go-epics/types"
@@ -31,10 +32,10 @@ import (
 )
 
 var (
+	expected = 10000000
 	fp_rate  = 0.001
 	maxRetry = 3
-	bfKey    = "crawler:" + ":bf"
-	client = &http.Client{
+	client   = &http.Client{
 		Timeout: 30 * time.Second,
 	}
 )
@@ -68,9 +69,10 @@ type Crawler struct {
 	duplicateCount atomic.Int64
 }
 
-func newTupleEvent(id string, w string, c int, url string) *tp.TupleEvent {
+func newTupleEvent(crwalerID, eventID string, w string, c int, url string) *tp.TupleEvent {
 	return &tp.TupleEvent{
-		Id:      id,
+		CrawlerID: crwalerID,
+		EventID: eventID,
 		Word:    w,
 		Count:   c,
 		URLHash: url,
@@ -167,7 +169,7 @@ func (c *Crawler) publishTupleWithRetry(ctx context.Context, freqMap map[string]
 
 	for word, count := range freqMap {
 		pid := partitionFor(word, indexerWorkers) // pid ranges betweem 1-4
-		tuple := newTupleEvent(uuid.NewString(), word, count, urlHash)
+		tuple := newTupleEvent(c.Id, uuid.NewString(), word, count, urlHash)
 		buckets[pid] = append(buckets[pid], *tuple)
 	}
 
@@ -209,7 +211,7 @@ func (c *Crawler) publishTuple(ctx context.Context, freqMap map[string]int, URLH
 
 	for word, count := range freqMap {
 		pid := partitionFor(word, indexerWorkers)
-		tuple := newTupleEvent(uuid.NewString(), word, count, URLHash)
+		tuple := newTupleEvent(c.Id, uuid.NewString(), word, count, URLHash)
 		buckets[pid] = append(buckets[pid], *tuple)
 	}
 
@@ -365,6 +367,12 @@ func resolveURL(href string, base *url.URL) string {
 func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats *nats.Client) (*Crawler, error) {
 	id := uuid.NewString()
 	queueID := fmt.Sprintf("queue:%s", id)
+	bfKey := "crawler:" + id + ":bf"
+
+	if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
+		log.Println("Bloom filter init failed:", err)
+		return nil, err
+	}
 
 	return &Crawler{
 		Id:       id,      // each crawler will have unique id
@@ -372,7 +380,7 @@ func NewCrawler(ctx context.Context, rdb *redis.Client, badger *badger.DB, nats 
 		rdb:      rdb,     // shared
 		badger:   badger,  // shared
 		nats:     nats,    // shared
-		bfKey:    bfKey,   // shared
+		bfKey:    bfKey,   // unique per crawler
 		// queue:    make(chan string, 10000), // unique (not required now)
 	}, nil
 }

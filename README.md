@@ -1,6 +1,6 @@
 # Go Distributed Web Crawler & Word-Frequency Indexer
 
-A concurrent, horizontally-partitioned web crawler written in Go, built to explore how a crawl-and-index pipeline behaves under real distributed-systems constraints: backpressure, deduplication at scale, partitioned stream processing, and exactly-once-*effective* delivery over an at-least-once message bus.
+A concurrent, horizontally-partitioned web crawler written in Go, built to explore how a crawl-and-index pipeline behaves under real distributed-systems constraints: backpressure, deduplication at scale, partitioned stream processing, and exactly-once-_effective_ delivery over an at-least-once message bus.
 
 Given one or more seed URLs, the system crawls a site breadth-first, extracts and counts words from every page, and durably aggregates a global word-frequency index in Postgres — while keeping every crawl instance isolated, every stage crash-recoverable, and every worker independently scalable.
 
@@ -10,14 +10,14 @@ Given one or more seed URLs, the system crawls a site breadth-first, extracts an
 
 ## The core problem, and how each version got fixed
 
-The commit history of this project *is* a distributed-systems debugging log. A few of the real problems hit and fixed along the way:
+The commit history of this project _is_ a distributed-systems debugging log. A few of the real problems hit and fixed along the way:
 
-| Problem | Root cause | Fix |
-|---|---|---|
-| Crawler deadlocks after ~10k URLs | Workers blocked on `chan string <- link`; once the buffer filled, every worker was stuck *sending* and none were left to *receive* | Replaced the in-memory channel with **Redis as the frontier** — workers `BRPOP` from a durable queue instead of blocking on a Go channel |
-| Same URL crawled twice under concurrent workers | Check-then-enqueue was two separate Redis calls — a classic TOCTOU race | Replaced with a **single atomic Lua script** that checks a Redis Bloom filter and pushes to the queue in one round trip |
-| Word counts could be inflated on consumer redelivery | NATS JetStream is at-least-once; a redelivered message would double-count words | Each event carries a stable UUID; the consumer inserts it into a `processed_events` table **inside the same Postgres transaction** as the count update — a redelivery after a committed transaction becomes a no-op |
-| One slow/failed DB flush could stall a whole partition forever | No isolation between "processing" and "durability" failures | Failed flushes retry with backoff, then get diverted to a **dead-letter stream (DLQ)** instead of blocking the consumer loop |
+| Problem                                                        | Root cause                                                                                                                         | Fix                                                                                                                                                                                                                 |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Crawler deadlocks after ~10k URLs                              | Workers blocked on `chan string <- link`; once the buffer filled, every worker was stuck _sending_ and none were left to _receive_ | Replaced the in-memory channel with **Redis as the frontier** — workers `BRPOP` from a durable queue instead of blocking on a Go channel                                                                            |
+| Same URL crawled twice under concurrent workers                | Check-then-enqueue was two separate Redis calls — a classic TOCTOU race                                                            | Replaced with a **single atomic Lua script** that checks a Redis Bloom filter and pushes to the queue in one round trip                                                                                             |
+| Word counts could be inflated on consumer redelivery           | NATS JetStream is at-least-once; a redelivered message would double-count words                                                    | Each event carries a stable UUID; the consumer inserts it into a `processed_events` table **inside the same Postgres transaction** as the count update — a redelivery after a committed transaction becomes a no-op |
+| One slow/failed DB flush could stall a whole partition forever | No isolation between "processing" and "durability" failures                                                                        | Failed flushes retry with backoff, then get diverted to a **dead-letter stream (DLQ)** instead of blocking the consumer loop                                                                                        |
 
 ---
 
@@ -64,13 +64,17 @@ POST /run/crawler {"seed_url": [...]}
 ## Engineering highlights
 
 ### 1. Per-request crawl isolation over shared infrastructure
+
 Every `POST /run/crawler` spins up a brand-new `Crawler` with its own UUID, its own Redis-backed Bloom filter key, and its own frontier queue — while sharing the same Redis, BadgerDB, and NATS connections across all crawls. Multiple crawls can run concurrently without ever polluting each other's "visited" state.
 
 ### 2. Redis as the frontier — not a Go channel
-Early versions used a buffered `chan string` as the link queue. It deadlocked: once the buffer filled, all 8 workers were blocked *pushing* new links and none were free to *pop* and process the backlog. The fix treats **Redis as the source of truth for pending work**, so the frontier can grow far past what fits in a channel buffer, and workers simply block on `BRPOP` with a timeout instead of a channel send.
+
+Early versions used a buffered `chan string` as the link queue. It deadlocked: once the buffer filled, all 8 workers were blocked _pushing_ new links and none were free to _pop_ and process the backlog. The fix treats **Redis as the source of truth for pending work**, so the frontier can grow far past what fits in a channel buffer, and workers simply block on `BRPOP` with a timeout instead of a channel send.
 
 ### 3. Atomic check-and-enqueue via Lua
+
 Deduplication needs to be exact under concurrency, so "is this URL new?" and "add it to the queue" happen as a **single atomic Redis Lua script** against a Bloom filter — eliminating the race where two workers both see a URL as "new" and enqueue it twice:
+
 ```lua
 if redis.call("BF.EXISTS", KEYS[1], ARGV[1]) == 0 then
     redis.call("BF.ADD", KEYS[1], ARGV[1])
@@ -81,51 +85,60 @@ return 0
 ```
 
 ### 4. Consistent-hash partitioned stream processing
+
 Extracted words aren't published one-by-one — they're bucketed by `sha256(word) % 4` into per-partition batches and published to dedicated NATS subjects (`TUPLE.0`–`TUPLE.3`). Four independent consumer goroutines each own one partition, so the same word is always handled by the same consumer, keeping word-count updates lock-free across consumers.
 
 ### 5. Effectively-once aggregation on top of at-least-once delivery
-NATS JetStream guarantees *at-least-once* delivery — messages can be redelivered after a crash or a slow ACK. Rather than fight that, the consumer embeds a stable event ID and makes redelivery a safe no-op:
+
+NATS JetStream guarantees _at-least-once_ delivery — messages can be redelivered after a crash or a slow ACK. Rather than fight that, the consumer embeds a stable event ID and makes redelivery a safe no-op:
+
 ```sql
 INSERT INTO processed_events(event_id) VALUES ($1)
 ON CONFLICT (event_id) DO NOTHING RETURNING event_id;
 -- only if a row was actually inserted:
-INSERT INTO word_counts(word, count) VALUES ($1, $2)
-ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count;
+INSERT INTO word_counts(crawler_id, word, count)
+VALUES ($1, $2, $3)
+ON CONFLICT (crawler_id, word)
+DO UPDATE SET count = word_counts.count + EXCLUDED.count
 ```
+
 Both statements run in the same transaction, so a message can be redelivered any number of times without ever double-counting a word.
 
-### 6. Time- *and* size-based batch flushing with a DLQ safety net
+### 6. Time- _and_ size-based batch flushing with a DLQ safety net
+
 Consumers batch up to 1000 messages or 5 seconds of accumulation (whichever comes first) before flushing to Postgres — trading a little latency for dramatically fewer round trips. If a flush fails after retries, the batch is pushed to a **dead-letter JetStream stream** instead of silently dropping data or wedging the consumer.
 
 ### 7. Graceful, cancellable, per-crawl shutdown
+
 Each running crawl is tracked in a `CrawlerManager` keyed by ID, mapped to its own `context.CancelFunc`. Hitting `GET /shutdown/crawler?id=...` cancels just that crawl's workers — letting others keep running — and `context.Context` cancellation propagates all the way down to in-flight consumer batches, which flush what they have before exiting instead of losing in-memory state.
 
 ### 8. Compact on-disk archive of every crawled page
+
 Every fetched page is gzip-compressed and written to an embedded **BadgerDB** LSM-tree store keyed by URL hash — a full local archive of the crawl, without needing S3 or a separate service for raw page storage.
 
 ---
 
 ## Tech stack
 
-| Layer | Choice | Why |
-|---|---|---|
-| Language | Go | Goroutines + channels map naturally onto a fan-out crawl workload |
-| HTTP | Standard library `net/http` | No framework needed for 3 routes; explicit control over the server lifecycle |
-| Frontier / dedup | Redis (Lists + RedisBloom) | Atomic Lua scripting, `BRPOP` blocking pop, probabilistic membership at scale |
-| Raw page storage | BadgerDB (embedded LSM KV store) | Fast local writes, no external dependency for archiving crawled HTML |
-| Messaging | NATS JetStream (partitioned, durable) | At-least-once delivery, replay, and independent per-partition consumers |
-| Aggregation store | PostgreSQL | Transactional idempotency (`ON CONFLICT`) for exactly-once *effective* counting |
-| HTML parsing | `golang.org/x/net/html` | Streaming DOM walk for link + text extraction without a heavier parser |
+| Layer             | Choice                                | Why                                                                             |
+| ----------------- | ------------------------------------- | ------------------------------------------------------------------------------- |
+| Language          | Go                                    | Goroutines + channels map naturally onto a fan-out crawl workload               |
+| HTTP              | Standard library `net/http`           | No framework needed for 3 routes; explicit control over the server lifecycle    |
+| Frontier / dedup  | Redis (Lists + RedisBloom)            | Atomic Lua scripting, `BRPOP` blocking pop, probabilistic membership at scale   |
+| Raw page storage  | BadgerDB (embedded LSM KV store)      | Fast local writes, no external dependency for archiving crawled HTML            |
+| Messaging         | NATS JetStream (partitioned, durable) | At-least-once delivery, replay, and independent per-partition consumers         |
+| Aggregation store | PostgreSQL                            | Transactional idempotency (`ON CONFLICT`) for exactly-once _effective_ counting |
+| HTML parsing      | `golang.org/x/net/html`               | Streaming DOM walk for link + text extraction without a heavier parser          |
 
 ---
 
 ## API
 
-| Method | Route | Description |
-|---|---|---|
-| `POST` | `/run/crawler` | Body: `{"seed_url": ["https://..."]}`. Starts an isolated crawl, returns its `id` immediately (202 Accepted) |
-| `GET` | `/shutdown/crawler?id={id}` | Cancels the running crawl with that ID |
-| `GET` | `/` | Health check |
+| Method | Route                       | Description                                                                                                  |
+| ------ | --------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `POST` | `/run/crawler`              | Body: `{"seed_url": ["https://..."]}`. Starts an isolated crawl, returns its `id` immediately (202 Accepted) |
+| `GET`  | `/shutdown/crawler?id={id}` | Cancels the running crawl with that ID                                                                       |
+| `GET`  | `/`                         | Health check                                                                                                 |
 
 ---
 
@@ -170,8 +183,16 @@ docker run -d -p 4222:4222 nats -js
 # postgres schema
 psql -U postgres -c "CREATE DATABASE tupledb;"
 psql -U postgres -d tupledb -c "
-  CREATE TABLE word_counts (word TEXT PRIMARY KEY, count BIGINT NOT NULL);
-  CREATE TABLE processed_events (event_id UUID PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS word_counts (
+      crawler_id UUID NOT NULL,
+      word TEXT NOT NULL,
+      count BIGINT NOT NULL,
+      PRIMARY KEY (crawler_id, word)
+  );
+  CREATE TABLE IF NOT EXISTS processed_events (
+      event_id UUID PRIMARY KEY,
+      processed_at TIMESTAMPTZ NOT NULL DEFAULT now ()
+  );
 "
 
 # build & run
@@ -206,6 +227,3 @@ Being transparent about the gap between "learning project" and "production-ready
 
 ---
 
-## License
-
-MIT — built for learning, free to learn from.

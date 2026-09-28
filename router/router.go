@@ -17,8 +17,8 @@ import (
 
 const (
 	fp_rate  = 0.001
-	bfKey    = "crawler:" + ":bf"
-	expected = 10000000
+	// bfKey    = "crawler:" + ":bf"
+	// expected = 10000000
 )
 
 var crawlerManager = NewCrawlerManager()
@@ -46,10 +46,10 @@ func ConnectInfra() (*RouterSrv, error) {
 		return nil, err
 	}
 
-	if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
-		log.Println("Bloom filter init failed:", err)
-		return nil, err
-	}
+	// if err := db.InitializeBloomFilterTest(ctx, rdb, bfKey, fp_rate, int64(expected)); err != nil {
+	// 	log.Println("Bloom filter init failed:", err)
+	// 	return nil, err
+	// }
 
 	badgerPath := "./crwal_db/"
 	badgerDB, err := badger.Open(badger.LSMOnlyOptions(badgerPath))

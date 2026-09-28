@@ -311,7 +311,10 @@ func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partiti
 	}
 	defer tx.Rollback()
 
-	query := `INSERT INTO word_counts(word, count) VALUES ($1, $2) ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count`
+	query := `INSERT INTO word_counts(crawler_id, word, count)
+	VALUES ($1, $2, $3)
+	ON CONFLICT (crawler_id, word)
+	DO UPDATE SET count = word_counts.count + EXCLUDED.count`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -322,9 +325,11 @@ func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partiti
 
 	log.Printf("[consumer-%v] flushing %d words to DB\n", partitionID, len(events))
 	for _, event := range events {
+		var insertedID string
+
 		query := `INSERT INTO processed_events(event_id) VALUES ($1)
 		ON CONFLICT (event_id) DO NOTHING RETURNING event_id`
-		err := tx.QueryRowContext(ctx, query, event.Id).Scan(&event.Id)
+		err := tx.QueryRowContext(ctx, query, event.EventID).Scan(&insertedID)
 
 		if err != nil {
 			// if no row was returned, event was already processed.
@@ -332,10 +337,10 @@ func (c *Client) flushDB(ctx context.Context, events []types.TupleEvent, partiti
 				continue
 			}
 
-			return fmt.Errorf("insert event %s: %w", event.Id, err)
+			return fmt.Errorf("insert event %s: %w", event.EventID, err)
 		}
 
-		if _, err := stmt.ExecContext(ctx, event.Word, event.Count); err != nil {
+		if _, err := stmt.ExecContext(ctx, event.CrawlerID, event.Word, event.Count); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("exec word %q: %w", event.Word, err)
 		}

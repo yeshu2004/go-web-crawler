@@ -143,8 +143,10 @@ Every event carries a stable UUID assigned at crawl time. The flush is a single 
 INSERT INTO processed_events(event_id) VALUES ($1)
 ON CONFLICT (event_id) DO NOTHING RETURNING event_id;
 -- only for rows that were newly inserted:
-INSERT INTO word_counts(word, count) VALUES ($1, $2)
-ON CONFLICT (word) DO UPDATE SET count = word_counts.count + EXCLUDED.count;
+INSERT INTO word_counts(crawler_id, word, count)
+VALUES ($1, $2, $3)
+ON CONFLICT (crawler_id, word)
+DO UPDATE SET count = word_counts.count + EXCLUDED.count
 ```
 Because the "have I processed this event before?" check and the count increment happen in the same transaction, a JetStream redelivery of an already-committed message becomes a safe no-op — the system achieves **effectively-once aggregation on top of at-least-once delivery**, without needing exactly-once messaging semantics from NATS itself.
 
@@ -158,14 +160,21 @@ Messages are only `Ack()`-ed after a successful flush; a failed flush is retried
 
 #### Schema (as actually used by `flushDB`)
 ```sql
-CREATE TABLE word_counts (
-  word  TEXT    PRIMARY KEY,
-  count BIGINT  NOT NULL
-);
+CREATE TABLE
+    IF NOT EXISTS word_counts (
+        crawler_id UUID NOT NULL,
+        word TEXT NOT NULL,
+        count BIGINT NOT NULL,
+        PRIMARY KEY (crawler_id, word)
+    );
 
-CREATE TABLE processed_events (
-  event_id UUID PRIMARY KEY
-);
+CREATE TABLE
+    IF NOT EXISTS word_counts (
+        crawler_id UUID NOT NULL,
+        word TEXT NOT NULL,
+        count BIGINT NOT NULL,
+        PRIMARY KEY (crawler_id, word)
+    );
 ```
 `processed_events` is the idempotency ledger described above — every event ID that has ever been successfully counted lives here, so redelivered messages are recognised and skipped rather than double-counted.
 
